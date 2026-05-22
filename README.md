@@ -1,6 +1,6 @@
 # Buddlys Voice Demo
 
-Browser-Textchat → Mistral Chat (Streaming) → Sentence-Chunking → Voxtral TTS → Audio im Browser.
+Browser-Textchat → Mistral Chat (Streaming) → Sentence-Chunking → TTS-Provider → Audio im Browser.
 
 ## Setup
 
@@ -24,20 +24,25 @@ npm run dev                   # http://localhost:5173
 | `MISTRAL_API_KEY` | – | Pflicht |
 | `MISTRAL_MODEL` | `mistral-small-2506` | **hier dein finetuned Modell eintragen**, z. B. `ft:mistral-small-2506:org:buddly:abcd` |
 | `MISTRAL_TTS_MODEL` | `voxtral-mini-tts-2603` | Voxtral TTS |
-| `MISTRAL_TTS_VOICE` | – | Pflicht. `voice_id` einer in Mistral Studio angelegten Voice |
-| `MISTRAL_TTS_FORMAT` | `mp3` | `mp3` / `wav` / `opus` / `pcm` / `flac` |
+| `MISTRAL_TTS_VOICE` | – | Pflicht für Provider `Mistral`. `voice_id` oder Name einer in Mistral Studio angelegten Voice |
+| `MISTRAL_TTS_FORMAT` | `mp3` | Nur für den non-streaming Helper. Der UI-Provider nutzt Streaming-`pcm` |
+| `RUNPOD_API_KEY` | – | Pflicht für Provider `OmniVoice` |
+| `OMNIVOICE_RUNPOD_ENDPOINT_ID` | – | RunPod Serverless Endpoint ID |
 | `PORT` | `3001` | Server-Port |
 
-> Voxtral TTS hat keine Preset-Stimmen. Du musst einmalig in Mistral Studio
-> eine Voice anlegen (Zero-Shot-Cloning aus 2–3 s Audio) und dann die
-> `voice_id` in `.env` setzen.
+> Für Voxtral TTS musst du einmalig in Mistral Studio eine Voice anlegen
+> (Zero-Shot-Cloning aus 2–3 s Audio) und dann die `voice_id` oder den Namen
+> in `.env` setzen. Im UI danach unter Einstellungen → TTS Provider
+> `Mistral` wählen.
 
-## Wenn dein Account noch keinen TTS-Zugang hat
+## TTS Provider
 
-Der TTS-Adapter ist isoliert in `server/src/mistralTts.ts`. Tausche dort die
-Funktion `synthesizeSpeech(text)` gegen einen anderen Provider (ElevenLabs,
-OpenAI TTS, Piper) aus – die Signatur `(text: string) => Promise<TtsResult>`
-muss bleiben. Der Chat-Streaming-Teil läuft unverändert weiter.
+- `Cartesia`: WebSocket-Streaming mit `pcm_s16le`.
+- `Mistral`: Voxtral TTS via `POST /v1/audio/speech` mit `stream:true`,
+  `response_format:"pcm"` und serverseitiger Float32-zu-s16-Konvertierung.
+- `OmniVoice`: RunPod Serverless Worker (`/run` + `/stream`) mit 24-kHz-PCM.
+
+RunPod-Deployment für OmniVoice: [docs/OMNIVOICE_RUNPOD.md](docs/OMNIVOICE_RUNPOD.md).
 
 ## Latenzlogs
 
