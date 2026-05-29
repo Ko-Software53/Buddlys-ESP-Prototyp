@@ -30,18 +30,14 @@ const TTS_FILLERS: string[] = [
   'Hmm.',
   'Mhm.',
   'Mh, mh.',
-  'Oh.',
-  'Oha.',
-  'Aha.',
   'Mh, interessant.',
-  'Ui.',
   // Kurze Phrasen
   'Moment.',
   'Warte mal.',
   'Hmm, kurz überlegen.',
   'Eine Sekunde.',
   'Mh, lass mich denken.',
-  'Oh, gute Frage.',
+  'Mh, mal sehen.',
   'Spannend.',
   'Hmm, lass mal sehen.',
   // Etwas längere natürliche Sätze
@@ -62,7 +58,12 @@ async function renderOne(text: string): Promise<Buffer> {
   session.onChunk((p) => parts.push(p));
   session.send(text, true);
   await session.done;
-  return Buffer.concat(parts);
+  // Pad with 100ms of silence at the start so the audio system has time
+  // to start playback before the actual sound begins (prevents clipping).
+  const silenceMs = 100;
+  const silenceBytes = Math.ceil((PCM_SAMPLE_RATE * silenceMs) / 1000) * 2; // 16-bit = 2 bytes/sample
+  const silence = Buffer.alloc(silenceBytes, 0);
+  return Buffer.concat([silence, ...parts]);
 }
 
 async function loadSfxFiles(): Promise<CachedFiller[]> {

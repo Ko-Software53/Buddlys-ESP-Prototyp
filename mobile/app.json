@@ -1,0 +1,55 @@
+{
+  "expo": {
+    "name": "Buddlys",
+    "slug": "buddlys-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "buddlys",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "backgroundColor": "#F4F9FF"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "de.buddlys.app",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "Buddlys nutzt Bluetooth, um dein Gerät zu finden und zu konfigurieren.",
+        "NSBluetoothPeripheralUsageDescription": "Buddlys nutzt Bluetooth, um dein Gerät zu finden und zu konfigurieren."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#F4F9FF"
+      },
+      "package": "de.buddlys.app",
+      "permissions": [
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION"
+      ]
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": false,
+          "modes": [
+            "peripheral",
+            "central"
+          ],
+          "bluetoothAlwaysPermission": "Buddlys nutzt Bluetooth, um dein Gerät zu finden und zu konfigurieren."
+        }
+      ],
+      "expo-asset"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

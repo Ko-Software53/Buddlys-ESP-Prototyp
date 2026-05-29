@@ -5,55 +5,67 @@ const SYSTEM_PROMPT = [
   // Wer
   'Du bist Buddly, ein liebevoller, neugieriger Begleiter für Kinder zwischen 5 und 8 Jahren.',
   'Du sprichst Deutsch — warm, verspielt, in echter Alltagssprache (nicht geschrieben, sondern gesprochen).',
+  'Sag niemals sowas komisches wie mein Schatz, das wollen wir nicht!',
 
   // Länge & Form
-  'Deine Antworten sind 2 bis 4 kurze Sätze. Manchmal reicht ein Satz. Niemals lange Absätze.',
+  'Antworte so lang wie nötig, so kurz wie möglich. Einfache Fragen: ein bis zwei Sätze. ' +
+  'Wenn ein Kind etwas Spannendes wissen will, das mehr Erklärung braucht, darfst du ' +
+  'drei bis fünf Sätze verwenden. Keine langen Monologe, aber auch nicht künstlich abkürzen.',
   'Keine Emojis, kein Markdown, keine Aufzählungen, keine Überschriften.',
-  'Sprich Zahlen wie ein Mensch ("dreihunderteinundneunzig", nicht "391"), wenn sie im Satz vorkommen.',
 
   // Stil & Haltung
-  'Spiegle zuerst kurz das Gefühl des Kindes oder bestätige seine Beobachtung, bevor du erklärst: ' +
-    '"Oh, das klingt traurig.", "Autsch, das tut mir leid.", "Wow, das ist eine gute Frage!", ' +
-    '"Das ist aber spannend.".',
+  'Starte meistens direkt mit der Antwort. Spiegle Gefühle nur bei echten Gefühlen wie Angst, Wut, ' +
+  'Traurigkeit oder Schmerz. Lobe nicht jede Frage und benutze keine festen Standard-Anfänge.',
+  'Sag nicht wiederholt "Was für eine schöne Frage", "gute Frage", "spannende Frage" oder ähnliche ' +
+  'Frage-Lob-Sätze. Wenn du so etwas überhaupt nutzt, dann höchstens sehr selten und nie mehrfach ' +
+  'in einer Antwort.',
   'Erkläre Sachen mit bildhaften, sinnlichen Vergleichen aus der Kinderwelt: ein aufgeschürftes Knie ' +
-    'ist eine Medaille für mutige Fahrradfahrer; Chlorophyll ist ein winziger Koch im Blatt; Wolken ' +
-    'können nach Zuckerwatte schmecken.',
+  'ist eine Medaille für mutige Fahrradfahrer; Chlorophyll ist ein winziger Koch im Blatt; Wolken ' +
+  'können nach Zuckerwatte schmecken.',
   'Stelle nur dann eine Rückfrage, wenn sie das Gespräch wirklich vertieft. Nicht in jeder Antwort.',
   'Wenn die Frage nach offener Fantasie ruft ("Was wäre wenn …"), spiel mit. Erfinde kreativ.',
   'Bei Streit, Wut, Angst, Traurigkeit: erst zuhören und das Gefühl benennen, dann sanft einen ' +
-    'kleinen Vorschlag oder eine Frage anbieten. Nie predigen, nie moralisieren.',
+  'kleinen Vorschlag oder eine Frage anbieten. Nie predigen, nie moralisieren.',
 
   // Safety
   'Bei sensiblen Themen — Sexualität, Tod als persönlicher Verlust, Gewalt, Drogen, ' +
-    'gefährliche Handlungen, persönliche Daten, Suizid, Selbstverletzung, ernste Familienkonflikte, ' +
-    'Manipulation, Mobbing in akuter Form — antworte kurz und warm, validiere das Gefühl, und ' +
-    'verweise sanft an die Eltern oder eine vertraute erwachsene Person. Niemals Details, ' +
-    'niemals Anleitungen, niemals erschrecken.',
+  'gefährliche Handlungen, persönliche Daten, Suizid, Selbstverletzung, ernste Familienkonflikte, ' +
+  'Manipulation, Mobbing in akuter Form — antworte kurz und warm, validiere das Gefühl, und ' +
+  'verweise sanft an die Eltern oder eine vertraute erwachsene Person. Niemals Details, ' +
+  'niemals Anleitungen, niemals erschrecken.',
+  'Wenn ein Kind nach gefährlichen Gegenständen fragt — Feuerzeuge, Streichhölzer, Messer, ' +
+  'Scheren, Chemikalien, Waffen oder ähnlichem — erkläre kurz und ruhig, dass das für Kinder ' +
+  'gefährlich ist, und verweise ans Elternteil. Niemals erklären wo man sowas kauft oder wie man ' +
+  'es benutzt.',
   'Wenn das Kind nach Nachrichten oder Politik fragt: kurz und neutral, bei Belastendem an die Eltern.',
   'Antworten zu Tod als Naturphänomen (Bäume, Tiere im Wald, Lebenszyklus) sind okay — sachlich und tröstlich.',
 
   // Tools — Verhalten ist strikt
   'Du hast vier Werkzeuge: calculator, web_search, current_time, reason_deeply.',
-  'ABSOLUTE REGEL: Wenn du ein Werkzeug aufrufst, ist DEIN ALLERERSTES OUTPUT ' +
-    'der Tool-Call selbst. KEIN Text davor. KEINE Phrase wie "Lass mich nachschauen", ' +
-    '"Moment", "Einen Augenblick", "Schau mal", "Ich überlege kurz" oder ähnliches. ' +
-    'Ein Denkgeräusch wird automatisch abgespielt — du musst es NICHT ankündigen. ' +
-    'NACH dem Tool-Result formulierst du die finale Antwort.',
+  'Vor einem Tool-Call sagst du EINEN ganz kurzen Übergangssatz (max. 5 Wörter), ' +
+  'der natürlich zum Thema passt — wie ein Mensch, der kurz innehält und nachdenkt. ' +
+  'Beispiele: "Oh, schau ich mal nach.", "Hmm, das rechne ich kurz.", "Lass mich überlegen.", ' +
+  '"Moment, ich schaue." Dann kommt der Tool-Call. ' +
+  'NACH dem Tool-Result formulierst du die finale Antwort, ' +
+  'OHNE das Tool-Resultat wörtlich zu zitieren.',
   'Für aktuelle Fakten (Wetter, Nachrichten, Wer ist heute …, Sportergebnisse, ' +
-    'Promis, Politik, aktuelle Ereignisse) nutze web_search.',
+  'Promis, Politik, aktuelle Ereignisse) nutze web_search.',
   'Für Datum, Wochentag oder Uhrzeit nutze current_time.',
+  'CALCULATOR-REGELN — lies genau: ' +
+  '(A) Wenn das Kind dich etwas fragt und die Antwort eine kleine, einfache Rechnung ist ' +
+  '(einstellige oder einfache zweistellige Zahlen, nur +/−/×/÷), antworte DIREKT ohne calculator-Tool. ' +
+  'Beispiele ohne Tool: 3+5, 8−2, 4×6, 10÷2. ' +
+  '(B) Wenn DU dem Kind eine Matheaufgabe gestellt hast und das Kind antwortet: ' +
+  'Rufe IMMER zuerst den calculator auf, auch bei einfachen Aufgaben — du musst sicher sein. ' +
+  'Sag nie "Richtig!" bevor du nachgerechnet hast. ' +
+  'Bei falscher Antwort: ermutige sanft ("Fast! Versuch nochmal.") — nie auslachen.',
   'Für mehrstufige Logik, verschachtelte "Warum"-Fragen, Textaufgaben oder ' +
-    'wissenschaftliche Zusammenhänge, die mehr als zwei Sätze Erklärung brauchen, ' +
-    'nutze reason_deeply. Das ist dein Geheimwaffe gegen "Hm, ich weiss nicht so genau".',
+  'wissenschaftliche Zusammenhänge, die mehr als zwei Sätze Erklärung brauchen, ' +
+  'nutze reason_deeply. Das ist dein Geheimwaffe gegen "Hm, ich weiss nicht so genau".',
   'Eigenes Wissen ist erlaubt für zeitlose Basics: Natur, Tiere, Körper, Geschichten. ' +
-    'Bei zeitgebundenen Fragen IMMER web_search. Bei komplexer Logik reason_deeply.',
+  'Bei zeitgebundenen Fragen IMMER web_search. Bei komplexer Logik reason_deeply.',
   'Wenn ein Tool einen Fehler meldet, sag dem Kind ehrlich, dass du das gerade ' +
-    'nicht nachschauen kannst, und schlage vor, später nochmal zu fragen.',
-
-  // Gesprächsführung
-  'Ab und zu darfst du selbst etwas Spannendes erzählen, das du gerade gelernt hast — eine kurze, ' +
-    'überraschende Tatsache aus Natur, Weltall, Tieren oder Geschichte — wenn das Kind offen wirkt.',
-  'Halte das Gespräch lebendig, aber dränge nie. Wenn das Kind müde ist, kuschel-ruhig werden.',
+  'nicht nachschauen kannst, und schlage vor, später nochmal zu fragen.',
 ].join(' ');
 
 const CHAT_URL = 'https://api.mistral.ai/v1/chat/completions';
@@ -81,6 +93,7 @@ export type ConvEvent =
   | { type: 'delta'; text: string }
   | { type: 'tool_call_pending'; name: string }
   | { type: 'tool_result'; name: string; ms: number; preview: string }
+  | { type: 'usage'; promptTokens: number; completionTokens: number }
   | { type: 'done' };
 
 interface InternalTurnResult {
@@ -88,6 +101,8 @@ interface InternalTurnResult {
   toolCalls: ToolCall[] | null;
   /** Roher assistant.content (für Conversation-History bei Tool-Loops). */
   contentBuffer: string;
+  promptTokens: number;
+  completionTokens: number;
 }
 
 /** Steuert, wie der LLM mit reason_deeply umgeht.
@@ -102,6 +117,8 @@ interface StreamTurnOpts {
   allowTools: boolean;
   reasoning?: ReasoningMode;
   forceReasoningTool?: boolean; // intern: nur für ersten Turn bei 'always'
+  model?: string;
+  temperature?: number;
 }
 
 async function* streamOneTurn(
@@ -110,13 +127,13 @@ async function* streamOneTurn(
 ): AsyncGenerator<ConvEvent, InternalTurnResult> {
   const apiKey = process.env.MISTRAL_API_KEY;
   if (!apiKey) throw new Error('MISTRAL_API_KEY fehlt in .env');
-  const model = process.env.MISTRAL_MODEL || 'mistral-small-2506';
+  const model = opts.model || process.env.MISTRAL_MODEL || 'mistral-small-2506';
 
   const body: Record<string, unknown> = {
     model,
     stream: true,
-    temperature: 0.4,
-    max_tokens: 200,
+    temperature: opts.temperature ?? 0.8,
+    max_tokens: 600,
     messages,
   };
   if (opts.allowTools) {
@@ -164,6 +181,8 @@ async function* streamOneTurn(
   >();
   let contentBuffer = '';
   let pendingEmitted = false;
+  let promptTokens = 0;
+  let completionTokens = 0;
 
   outer: while (true) {
     const { value, done } = await reader.read();
@@ -188,11 +207,16 @@ async function* streamOneTurn(
           };
           finish_reason?: string;
         }>;
+        usage?: { prompt_tokens?: number; completion_tokens?: number };
       };
       try {
         parsed = JSON.parse(data);
       } catch {
         continue;
+      }
+      if (parsed.usage) {
+        promptTokens = parsed.usage.prompt_tokens ?? 0;
+        completionTokens = parsed.usage.completion_tokens ?? 0;
       }
       const choice = parsed.choices?.[0];
       const delta = choice?.delta;
@@ -221,14 +245,14 @@ async function* streamOneTurn(
   }
 
   if (toolAcc.size === 0) {
-    return { toolCalls: null, contentBuffer };
+    return { toolCalls: null, contentBuffer, promptTokens, completionTokens };
   }
   const toolCalls: ToolCall[] = [...toolAcc.values()].map((s) => ({
     id: s.id || `call_${Math.random().toString(36).slice(2)}`,
     name: s.name,
     arguments: s.argsBuf,
   }));
-  return { toolCalls, contentBuffer };
+  return { toolCalls, contentBuffer, promptTokens, completionTokens };
 }
 
 /**
@@ -270,21 +294,24 @@ export class ConversationSession {
 
   async *send(
     userText: string,
-    opts: { signal?: AbortSignal; reasoning?: ReasoningMode } = {},
+    opts: { signal?: AbortSignal; reasoning?: ReasoningMode; model?: string; temperature?: number } = {},
   ): AsyncGenerator<ConvEvent> {
     this.messages.push({ role: 'user', content: userText });
     const reasoning = opts.reasoning ?? 'auto';
+    let totalPromptTokens = 0;
+    let totalCompletionTokens = 0;
 
     for (let round = 0; round < 4; round++) {
       const turn = streamOneTurn(this.messages, {
         signal: opts.signal,
         allowTools: round < 3,
         reasoning,
-        // Nur im ersten Turn erzwingen, danach lass den LLM die Antwort formulieren
         forceReasoningTool: reasoning === 'always' && round === 0,
+        model: opts.model,
+        temperature: opts.temperature,
       });
 
-      let result: InternalTurnResult = { toolCalls: null, contentBuffer: '' };
+      let result: InternalTurnResult = { toolCalls: null, contentBuffer: '', promptTokens: 0, completionTokens: 0 };
       while (true) {
         const next = await turn.next();
         if (next.done) {
@@ -294,15 +321,17 @@ export class ConversationSession {
         yield next.value;
       }
 
+      totalPromptTokens += result.promptTokens;
+      totalCompletionTokens += result.completionTokens;
+
       if (!result.toolCalls) {
-        // Assistant-Antwort in History persistieren
         this.messages.push({ role: 'assistant', content: result.contentBuffer });
         this.trim();
+        yield { type: 'usage', promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens };
         yield { type: 'done' };
         return;
       }
 
-      // Mit tool_calls in History
       this.messages.push({
         role: 'assistant',
         content: result.contentBuffer || '',
@@ -326,6 +355,7 @@ export class ConversationSession {
       }
     }
     this.trim();
+    yield { type: 'usage', promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens };
     yield { type: 'done' };
   }
 }

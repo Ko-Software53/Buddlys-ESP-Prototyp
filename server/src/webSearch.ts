@@ -45,15 +45,13 @@ export async function webSearch(query: string): Promise<string> {
       results?: Array<{ title?: string; content?: string; url?: string }>;
     };
 
-    const answer = (data.answer || '').trim();
-    if (answer) return answer;
-
-    // Kein zusammengefasstes Answer-Feld → erste Treffer-Snippets joinen
+    // Tavily's AI-generated `answer` field is unreliable (wrong units, hallucinations).
+    // Use raw result snippets instead — they contain the actual source text.
     const snippets = (data.results || [])
       .map((r) => r.content || r.title)
       .filter(Boolean)
-      .slice(0, 2)
-      .join(' — ');
+      .slice(0, 3)
+      .join('\n\n');
     return snippets || 'Keine relevanten Treffer gefunden.';
   } catch (err) {
     return `Web-Suche Fehler: ${(err as Error).message}`;

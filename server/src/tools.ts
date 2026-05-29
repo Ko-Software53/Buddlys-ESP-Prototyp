@@ -25,8 +25,10 @@ export const TOOL_DEFS: MistralToolDef[] = [
     function: {
       name: 'calculator',
       description:
-        'Rechnet Mathe-Ausdrücke aus. Nutze dies für jede Rechnung, ' +
-        'auch wenn das Kind nach Quadratzahlen, Prozent oder Wurzeln fragt.',
+        'Rechnet Mathe-Ausdrücke aus. Nutze dies NUR für Rechnungen, die du nicht ' +
+        'sofort im Kopf weißt: große Zahlen (ab ca. dreistellig), Quadratzahlen, ' +
+        'Wurzeln, Prozent, mehrere Rechenschritte. Einfaches Kopfrechnen mit kleinen ' +
+        'Zahlen (z. B. 3 + 5, 10 − 4, 2 × 6) machst du direkt ohne Tool.',
       parameters: {
         type: 'object',
         properties: {
@@ -149,9 +151,12 @@ export async function dispatchTool(call: ToolCall): Promise<ToolResult> {
 function doCalc(expr: string): string {
   const cleaned = expr.trim();
   if (!cleaned) return 'Kein Ausdruck angegeben.';
-  // mathjs evaluate ist sandboxed (kein Zugriff auf JS-Globals)
   const result = evaluate(cleaned);
-  return `Ergebnis: ${String(result)}`;
+  const formatted =
+    typeof result === 'number'
+      ? result.toLocaleString('de-DE', { maximumFractionDigits: 10, useGrouping: false })
+      : String(result);
+  return `Ergebnis: ${formatted}`;
 }
 
 function doNow(): string {

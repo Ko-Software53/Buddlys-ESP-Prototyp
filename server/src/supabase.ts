@@ -1,0 +1,56 @@
+import { createClient } from '@supabase/supabase-js';
+import ws from 'ws';
+
+const url = process.env.SUPABASE_URL;
+const key = process.env.SUPABASE_SERVICE_KEY;
+
+export const supabase = url && key
+  ? createClient(url, key, {
+      auth: { persistSession: false },
+      realtime: { transport: ws as unknown as typeof WebSocket },
+    })
+  : null;
+
+export async function getDeviceConfig(hardwareId: string) {
+  if (!supabase) return null;
+  const { data } = await supabase
+    .from('devices')
+    .select('id, owner_id, model, tts_provider, temperature, language')
+    .eq('device_id', hardwareId)
+    .maybeSingle();
+  return data;
+}
+
+export async function touchDevice(hardwareId: string) {
+  if (!supabase) return;
+  await supabase
+    .from('devices')
+    .update({ last_seen_at: new Date().toISOString() })
+    .eq('device_id', hardwareId);
+}
+
+export async function createConversation(deviceRowId: string, userId: string): Promise<string | null> {
+  if (!supabase) return null;
+  const { data, error } = await supabase
+    .from('conversations')
+    .insert({ device_id: deviceRowId, user_id: userId })
+    .select('id')
+    .single();
+  if (error) { console.error('[supabase] createConversation:', error.message); return null; }
+  return data.id;
+}
+
+export async function appendMessage(
+  conversationId: string,
+  role: 'user' | 'assistant',
+  content: string,
+) {
+  if (!supabase || !conversationId) return;
+  await Promise.all([
+    supabase.from('messages').insert({ conversation_id: conversationId, role, content }),
+    supabase
+      .from('conversations')
+      .update({ updated_at: new Date().toISOString() })
+      .eq('id', conversationId),
+  ]);
+}

@@ -11,18 +11,25 @@ export interface ChunkerOptions {
   minLen?: number;
   /** Harte Obergrenze. Bei Überschreitung wird am letzten Whitespace getrennt. */
   maxLen?: number;
+  /** Zusätzliche Terminatoren (z. B. ',' für Cartesia-Clause-Streaming). */
+  extraTerminators?: string[];
 }
 
-const TERMINATORS = new Set(['.', '?', '!', '…']);
+const SENTENCE_TERMINATORS = new Set(['.', '?', '!', '…']);
+const TERMINATORS = SENTENCE_TERMINATORS; // kept for backwards compat
 
 export class SentenceChunker {
   private buffer = '';
   private readonly minLen: number;
   private readonly maxLen: number;
+  private readonly terminators: Set<string>;
 
   constructor(opts: ChunkerOptions = {}) {
     this.minLen = opts.minLen ?? 24;
     this.maxLen = opts.maxLen ?? 120;
+    this.terminators = opts.extraTerminators
+      ? new Set([...SENTENCE_TERMINATORS, ...opts.extraTerminators])
+      : SENTENCE_TERMINATORS;
   }
 
   /** Neuen Text-Delta einspeisen, fertige Chunks zurückgeben. */
@@ -49,7 +56,7 @@ export class SentenceChunker {
 
     for (let i = 0; i < this.buffer.length; i++) {
       const ch = this.buffer[i];
-      if (!TERMINATORS.has(ch)) continue;
+      if (!this.terminators.has(ch)) continue;
       if (i + 1 < this.minLen) continue;
       // "262.144" oder "1.000" → Punkt vor Ziffer ist kein Satzende
       if (ch === '.' && /\d/.test(this.buffer[i + 1] ?? '')) continue;

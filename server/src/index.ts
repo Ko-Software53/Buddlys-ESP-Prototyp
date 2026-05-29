@@ -24,8 +24,12 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { ConversationSession } from './mistralChat.js';
 import { transcribeAudio } from './mistralStt.js';
 import { openCartesiaSession } from './cartesiaTts.js';
+import { openMistralTtsSession } from './mistralTts.js';
+import { openOmniVoiceSession } from './omnivoiceTts.js';
 import { SentenceChunker } from './chunker.js';
 import { preloadFillers, pickFiller } from './fillerCache.js';
+import { spellOutNumbers } from './numberToWords.js';
+import { getDeviceConfig, touchDevice, createConversation, appendMessage } from './supabase.js';
 
 const PORT = Number(process.env.PORT) || 3001;
 
@@ -73,10 +77,19 @@ app.post(
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-type TtsMode = 'streaming' | 'full';
 type ReasoningMode = 'auto' | 'always' | 'never';
+type TtsProvider = 'cartesia' | 'mistral' | 'omnivoice';
+
+interface TtsSession {
+  send(text: string, isFinal: boolean): void;
+  onChunk(cb: (pcm: Buffer) => void): void;
+  done: Promise<void>;
+  close(): void;
+  sampleRate: number;
+  encoding: 'pcm_s16le';
+}
 type ClientMsg =
-  | { type: 'user_text'; text: string; mode?: TtsMode; reasoning?: ReasoningMode }
+  | { type: 'user_text'; text: string; reasoning?: ReasoningMode; model?: string; tts?: boolean; temperature?: number; ttsProvider?: TtsProvider; device_id?: string }
   | { type: 'reset' };
 
 function safeSend(ws: WebSocket, payload: unknown) {
@@ -93,12 +106,26 @@ function isSpeakable(text: string): boolean {
   return /\p{L}|\p{N}/u.test(text);
 }
 
+/** Bereitet Text für TTS vor: Satzende-Punkt nach Ziffern entfernen,
+ *  dann alle Zahlen auf Deutsch ausschreiben ("42" → "zweiundvierzig"). */
+function fixTtsNumbers(text: string): string {
+  const stripped = text.replace(/(\d)\.(\s|$)/g, '$1$2');
+  return spellOutNumbers(stripped);
+}
+
 wss.on('connection', (ws) => {
   console.log('[ws] client connected');
 
-  // Eine Konversations-Session pro WebSocket = Gedächtnis über die ganze
-  // Verbindung. Neuer Tab / Reload = neue Session.
   const session = new ConversationSession();
+  const sessionStart = Date.now();
+  let sessionPromptTokens = 0;
+  let sessionCompletionTokens = 0;
+  let sessionTurns = 0;
+
+  // Supabase state: set on first user_text with a device_id
+  let currentConversationId: string | null = null;
+  let deviceRowId: string | null = null;
+  let deviceOwnerId: string | null = null;
 
   ws.on('message', async (raw) => {
     let msg: ClientMsg;
@@ -110,6 +137,10 @@ wss.on('connection', (ws) => {
     }
     if (msg?.type === 'reset') {
       session.reset();
+      sessionPromptTokens = 0;
+      sessionCompletionTokens = 0;
+      sessionTurns = 0;
+      currentConversationId = null;
       safeSend(ws, { type: 'done' });
       return;
     }
@@ -117,13 +148,36 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    const mode: TtsMode = msg.mode === 'streaming' ? 'streaming' : 'full';
+    // Resolve device config from Supabase if a hardware device_id was sent
+    if (msg.device_id && !deviceRowId) {
+      const dev = await getDeviceConfig(msg.device_id!);
+      if (dev) {
+        deviceRowId = dev.id;
+        deviceOwnerId = dev.owner_id;
+        void touchDevice(msg.device_id!);
+        console.log(`[supabase] device resolved: ${dev.id}`);
+      }
+    }
+
+    // Start a new conversation in Supabase for this turn session
+    if (!currentConversationId && deviceRowId && deviceOwnerId) {
+      currentConversationId = await createConversation(deviceRowId, deviceOwnerId);
+    }
+
     const reasoning: ReasoningMode =
       msg.reasoning === 'always' || msg.reasoning === 'never' ? msg.reasoning : 'auto';
+    const ttsEnabled = msg.tts !== false;
+    const ttsProvider: TtsProvider =
+      msg.ttsProvider === 'omnivoice' || msg.ttsProvider === 'mistral'
+        ? msg.ttsProvider
+        : 'cartesia';
+    const model = msg.model || undefined;
+    const temperature = typeof msg.temperature === 'number' ? Math.min(1.5, Math.max(0, msg.temperature)) : undefined;
     const t0 = Date.now();
     let firstTokenLogged = false;
     let firstAudioLogged = false;
-    let cartesia: Awaited<ReturnType<typeof openCartesiaSession>> | null = null;
+
+    let tts: TtsSession | null = null;
 
     const logFirstAudio = () => {
       if (firstAudioLogged) return;
@@ -131,10 +185,9 @@ wss.on('connection', (ws) => {
       sendLatency(ws, 'first audio out', Date.now() - t0);
     };
 
-    /** Spielt einen vorgerenderten Filler an den Client.
-     *  Nutzt NICHT die laufende Cartesia-Session — direkt PCM aus Cache,
-     *  damit es sofort losgeht (~0 ms). */
+    /** Pre-rendered Filler-Audio (Cartesia-PCM aus dem Cache). */
     const playFiller = () => {
+      if (!ttsEnabled) return;
       const f = pickFiller();
       if (!f) return;
       logFirstAudio();
@@ -147,86 +200,139 @@ wss.on('connection', (ws) => {
       safeSend(ws, { type: 'text_delta', text: f.text + ' ' });
     };
 
-    try {
-      const ttsT0 = Date.now();
-      cartesia = await openCartesiaSession();
-      sendLatency(ws, 'tts session open', Date.now() - ttsT0);
+    // Start TTS session immediately in the background — don't await here so the
+    // LLM fetch can start in parallel. By the time the first sentence is ready
+    // (~300 ms+), the WS handshake (~100 ms) is already done.
+    const ttsT0 = Date.now();
+    const ttsPromise: Promise<TtsSession | null> = ttsEnabled
+      ? (ttsProvider === 'mistral'
+          ? openMistralTtsSession()
+          : ttsProvider === 'omnivoice'
+          ? openOmniVoiceSession()
+          : openCartesiaSession()
+        ).then((s) => {
+          sendLatency(ws, `tts session open (${ttsProvider})`, Date.now() - ttsT0);
+          return s;
+        }).catch((err) => {
+          console.error('[tts open]', err);
+          return null;
+        })
+      : Promise.resolve(null);
 
-      // Cartesia → Client: PCM-Chunks der eigentlichen Antwort
-      cartesia.onChunk((pcm) => {
+    // Lazily await TTS and register the chunk callback exactly once.
+    const ensureTts = async (): Promise<boolean> => {
+      if (tts) return true;
+      tts = await ttsPromise;
+      if (!tts) return false;
+      tts.onChunk((pcm) => {
         if (!pcm.length) return;
         logFirstAudio();
         safeSend(ws, {
           type: 'audio_chunk',
-          encoding: cartesia!.encoding,
-          sampleRate: cartesia!.sampleRate,
+          encoding: tts!.encoding,
+          sampleRate: tts!.sampleRate,
           audioBase64: pcm.toString('base64'),
         });
       });
+      return true;
+    };
 
-      // Streaming-Modus: Satz-Chunker zwischen LLM und Cartesia
-      // Full-Modus: Text komplett einsammeln, ein einziger Cartesia-Push
-      const chunker =
-        mode === 'streaming'
-          ? new SentenceChunker({ minLen: 24, maxLen: 120 })
-          : null;
-      let fullText = '';
-      let pushedToCartesia = false;
+    // Persist user message
+    void appendMessage(currentConversationId!, 'user', msg.text);
 
-      for await (const ev of session.send(msg.text, { reasoning })) {
+    let assistantText = '';
+
+    try {
+      const chunker = ttsEnabled ? new SentenceChunker({ minLen: 10, maxLen: 120 }) : null;
+      let llmOutputThisRound = false;
+
+      const pushChunk = async (text: string, isFinal: boolean) => {
+        if (!ttsEnabled || !await ensureTts()) return;
+        const cleaned = fixTtsNumbers(text);
+        if (isSpeakable(cleaned)) tts!.send(cleaned, isFinal);
+        else if (isFinal) tts!.send(' ', true);
+      };
+
+      for await (const ev of session.send(msg.text, { reasoning, model, temperature })) {
         if (ev.type === 'delta') {
           if (!firstTokenLogged) {
             firstTokenLogged = true;
             sendLatency(ws, 'first text token', Date.now() - t0);
           }
           safeSend(ws, { type: 'text_delta', text: ev.text });
+          assistantText += ev.text;
+          llmOutputThisRound = true;
           if (chunker) {
-            const chunks = chunker.push(ev.text);
-            for (const c of chunks) {
-              if (!isSpeakable(c)) continue;
-              cartesia.send(c, false);
-              pushedToCartesia = true;
-            }
-          } else {
-            fullText += ev.text;
+            for (const c of chunker.push(ev.text)) await pushChunk(c, false);
           }
         } else if (ev.type === 'tool_call_pending') {
           sendLatency(ws, `tool start (${ev.name})`, Date.now() - t0);
-          playFiller();
+          // Rest aus dem Chunker raus — kann der LLM-Intro-Satz sein
+          if (chunker) {
+            const tail = chunker.flush();
+            if (tail) await pushChunk(tail, false);
+          }
+          if (!llmOutputThisRound) {
+            // LLM hat nichts gesagt vor dem Tool-Call → canned Filler als Brücke
+            playFiller();
+          }
+          llmOutputThisRound = false;
         } else if (ev.type === 'tool_result') {
           sendLatency(ws, `tool done (${ev.name})`, ev.ms);
           console.log(`[tool] ${ev.name} → ${ev.preview}`);
+        } else if (ev.type === 'usage') {
+          sessionTurns++;
+          sessionPromptTokens += ev.promptTokens;
+          sessionCompletionTokens += ev.completionTokens;
+          const sessionMinutes = (Date.now() - sessionStart) / 60000;
+          const sessionTotal = sessionPromptTokens + sessionCompletionTokens;
+          const perMin = sessionMinutes > 0 ? Math.round(sessionTotal / sessionMinutes) : 0;
+          console.log(
+            `[tokens] turn #${sessionTurns}: ${ev.promptTokens}p + ${ev.completionTokens}c` +
+            ` | session: ${sessionPromptTokens}p + ${sessionCompletionTokens}c = ${sessionTotal}` +
+            ` | ${sessionMinutes.toFixed(1)}min | ø ${perMin} tok/min`,
+          );
+          safeSend(ws, {
+            type: 'usage',
+            promptTokens: ev.promptTokens,
+            completionTokens: ev.completionTokens,
+            sessionPromptTokens,
+            sessionCompletionTokens,
+            sessionTurns,
+            sessionMinutes: Math.round(sessionMinutes * 10) / 10,
+          });
         } else if (ev.type === 'done') {
-          // ignore — wir finalisieren unten
+          // ignore — finalisieren unten
         }
       }
 
-      // TTS finalisieren
-      if (chunker) {
-        const tail = chunker.flush();
-        if (tail && isSpeakable(tail)) {
-          cartesia.send(tail, true);
-          pushedToCartesia = true;
-        } else if (pushedToCartesia) {
-          cartesia.send('', true);
-        } else {
-          cartesia.send(' ', true);
+      // Finalisieren: letzten Chunk mit isFinal=true rausgeben
+      if (ttsEnabled) {
+        const tail = chunker?.flush() ?? null;
+        if (tail) {
+          await pushChunk(tail, true);
+        } else if (await ensureTts()) {
+          tts!.send(' ', true);
         }
-      } else {
-        const clean = fullText.trim();
-        sendLatency(ws, `tts push (${clean.length} chars)`, Date.now() - t0);
-        cartesia.send(clean && isSpeakable(clean) ? clean : ' ', true);
+        const doneTts = tts as TtsSession | null;
+        if (doneTts) {
+          await doneTts.done;
+          sendLatency(ws, 'tts done', Date.now() - t0);
+        }
       }
 
-      await cartesia.done;
-      sendLatency(ws, 'tts done', Date.now() - t0);
+      // Persist assistant reply
+      if (assistantText.trim()) {
+        void appendMessage(currentConversationId!, 'assistant', assistantText.trim());
+      }
+
       sendLatency(ws, 'total', Date.now() - t0);
       safeSend(ws, { type: 'done' });
     } catch (err) {
       console.error('[err]', err);
       safeSend(ws, { type: 'error', message: (err as Error).message });
     } finally {
-      cartesia?.close();
+      (tts as TtsSession | null)?.close();
     }
   });
 

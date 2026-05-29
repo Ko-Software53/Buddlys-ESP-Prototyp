@@ -25,7 +25,7 @@ import { randomUUID } from 'node:crypto';
 
 const WS_URL_BASE = 'wss://api.cartesia.ai/tts/websocket';
 const VERSION = '2026-03-01';
-export const PCM_SAMPLE_RATE = 24000;
+export const PCM_SAMPLE_RATE = 16000;
 export const PCM_ENCODING = 'pcm_s16le' as const;
 
 export interface CartesiaSession {
@@ -59,6 +59,7 @@ export async function openCartesiaSession(
   if (!voiceId) throw new Error('CARTESIA_VOICE_ID fehlt in .env');
   const model = process.env.CARTESIA_MODEL || 'sonic-3';
   const language = process.env.CARTESIA_LANGUAGE || 'de';
+  const speed = opts.generationConfig?.speed ?? parseFloat(process.env.CARTESIA_SPEED || '0.85');
 
   const url = `${WS_URL_BASE}?cartesia_version=${VERSION}`;
   const ws = new WebSocket(url, {
@@ -128,8 +129,8 @@ export async function openCartesiaSession(
         },
         language,
         continue: !isFinal,
+        generation_config: { speed },
       };
-      if (opts.generationConfig) payload.generation_config = opts.generationConfig;
       ws.send(JSON.stringify(payload));
     },
     onChunk(cb) {

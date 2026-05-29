@@ -72,14 +72,17 @@ gegen Tool-Latenz.
 | `tools.ts` | Tool-Schemas + `dispatchTool()` (calculator/web_search/current_time) |
 | `webSearch.ts` | Tavily-Wrapper, `include_answer:true` für voice-taugliche Antwort |
 | `fillerCache.ts` | 6 vorgenerierte „Thinking-Sounds" als PCM im RAM |
-| `mistralTts.ts` | Nicht aktiv — Mistral-Voxtral-TTS-Adapter als Fallback |
+| `mistralTts.ts` | Mistral Voxtral TTS via Streaming-SSE, PCM float32 → PCM s16le |
+| `omnivoiceTts.ts` | RunPod Serverless OmniVoice-Client (`/run` + `/stream`) |
 
 ### Externe APIs
 | Dienst | Wofür | Endpoint | Auth |
 |---|---|---|---|
 | Mistral | Chat + Tool-Use | `POST /v1/chat/completions` (stream) | Bearer |
 | Mistral | STT | `POST /v1/audio/transcriptions` | Bearer |
+| Mistral | TTS | `POST /v1/audio/speech` (`stream:true`, `response_format:"pcm"`) | Bearer |
 | Cartesia | TTS (Streaming) | `wss://api.cartesia.ai/tts/websocket` | `X-API-Key` |
+| RunPod | OmniVoice TTS | `POST /v2/{endpoint}/run`, `GET /stream/{job}` | Bearer |
 | Tavily | Web-Suche | `POST /search` | `api_key` im Body |
 
 ---
@@ -222,9 +225,10 @@ PORT=3001
 4. Mistral-Modell muss `tool_choice:'auto'` korrekt umsetzen (mistral-small-2506+ tut das).
 
 ### Andere TTS-Engine
-`server/src/cartesiaTts.ts` ersetzen. Schnittstelle:
+Neue Provider implementieren dieselbe Session-Schnittstelle wie `cartesiaTts.ts`,
+`mistralTts.ts` und `omnivoiceTts.ts`:
 ```ts
-openCartesiaSession(): Promise<{
+openProviderSession(): Promise<{
   send(text: string, isFinal: boolean): void;
   onChunk(cb: (pcm: Buffer) => void): void;
   done: Promise<void>;
@@ -233,7 +237,10 @@ openCartesiaSession(): Promise<{
   encoding: 'pcm_s16le';
 }>
 ```
-Wenn die neue Engine MP3/WAV liefert statt PCM, im Client den `audio_chunk`-Handler erweitern (gibt's schon, fällt automatisch auf `decodeAudioData` zurück).
+Wenn die neue Engine MP3/WAV liefert statt PCM, im Client den
+`audio_chunk`-Handler erweitern (gibt's schon, fällt automatisch auf
+`decodeAudioData` zurück). Streaming-PCM ist für Voice-Agent-Latenz robuster,
+weil einzelne MP3/WAV-Fragmente nicht immer separat decodierbar sind.
 
 ### Anderes LLM
 `server/src/mistralChat.ts` anpassen. Die Tool-Loop-Logik ist OpenAI-kompatibel (Anthropic, Together, Groq, vLLM-self-hosted gehen alle mit minimalen Änderungen).
@@ -270,7 +277,8 @@ Buddlys Mistal AI/
 │       ├── index.ts          ← Express + ws + Pipeline-Orchestrierung
 │       ├── mistralChat.ts    ← Tool-Loop, runConversation()
 │       ├── mistralStt.ts     ← Voxtral STT
-│       ├── mistralTts.ts     ← (optionaler Fallback, ungenutzt)
+│       ├── mistralTts.ts     ← Mistral Voxtral Streaming-SSE
+│       ├── omnivoiceTts.ts   ← RunPod OmniVoice Serverless-Stream
 │       ├── cartesiaTts.ts    ← Cartesia Streaming-Session
 │       ├── chunker.ts        ← Satz-Chunker
 │       ├── tools.ts          ← Tool-Schemas + dispatchTool()

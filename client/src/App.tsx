@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
+import logoUrl from '../../assets/Logo_buddlys_blue.png';
+import signetUrl from '../../assets/Logo_buddlys_signet_blue.png';
 
 type ServerMsg =
   | { type: 'text_delta'; text: string }
@@ -10,20 +12,68 @@ type ServerMsg =
       sampleRate?: number;
     }
   | { type: 'latency'; label: string; ms: number }
+  | {
+      type: 'usage';
+      promptTokens: number;
+      completionTokens: number;
+      sessionPromptTokens: number;
+      sessionCompletionTokens: number;
+      sessionTurns: number;
+      sessionMinutes: number;
+    }
   | { type: 'done' }
   | { type: 'error'; message: string };
 
+interface TurnUsage {
+  turn: number;
+  ts: number;
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+}
+
+// Approximate Mistral pricing (USD per 1M tokens)
+const PRICE_INPUT = 0.10;
+const PRICE_OUTPUT = 0.30;
+
 type Status = 'idle' | 'thinking' | 'speaking' | 'done' | 'error';
-type TtsMode = 'streaming' | 'full';
 type ReasoningMode = 'auto' | 'always' | 'never';
+type TtsProvider = 'cartesia' | 'mistral' | 'omnivoice';
+type BackendMode = 'local' | 'runpod';
+
+function savedBackendMode(): BackendMode {
+  return localStorage.getItem('buddly_backend') === 'runpod' ? 'runpod' : 'local';
+}
+
+function savedRunpodUrl(): string {
+  return localStorage.getItem('buddly_runpod_url') || '';
+}
+
+function deriveUrls(base: string) {
+  const b = base.replace(/\/$/, '');
+  const ws = b.startsWith('https://')
+    ? 'wss://' + b.slice(8) + '/ws'
+    : 'ws://' + b.replace(/^http:\/\//, '') + '/ws';
+  return { ws, stt: b + '/stt' };
+}
+const MODELS = [
+  { id: 'mistral-small-2506', label: 'Small 2506', desc: 'Baseline' },
+  { id: 'mistral-small-2603', label: 'Small 4', desc: 'Neuester Small' },
+  { id: 'open-mistral-nemo', label: 'Nemo', desc: '12B Open-weight' },
+  { id: 'mistral-medium-2505', label: 'Medium 2505', desc: 'Größer' },
+];
 
 interface LatencyEntry {
   label: string;
   ms: number;
 }
 
-const WS_URL = 'ws://localhost:3001/ws';
-const STT_URL = 'http://localhost:3001/stt';
+const LOCAL_BASE = 'http://localhost:3001';
+
+function savedTtsProvider(): TtsProvider {
+  const raw = localStorage.getItem('buddly_tts_provider');
+  return raw === 'mistral' || raw === 'omnivoice' ? raw : 'cartesia';
+}
 
 function base64ToArrayBuffer(b64: string): ArrayBuffer {
   const bin = atob(b64);
@@ -32,19 +82,24 @@ function base64ToArrayBuffer(b64: string): ArrayBuffer {
   return bytes.buffer;
 }
 
+interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  pending?: boolean;
+}
+
 export function App() {
   const [text, setText] = useState('');
-  const [answer, setAnswer] = useState('');
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [status, setStatus] = useState<Status>('idle');
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [needsUnlock, setNeedsUnlock] = useState(false);
   const [wsReady, setWsReady] = useState(false);
 
   const [recording, setRecording] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
-  const [mode, setMode] = useState<TtsMode>(
-    (localStorage.getItem('buddly_mode') as TtsMode | null) ?? 'full',
-  );
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [reasoning, setReasoning] = useState<ReasoningMode>(
     (localStorage.getItem('buddly_reasoning') as ReasoningMode | null) ?? 'auto',
   );
@@ -52,13 +107,57 @@ export function App() {
     setReasoning(r);
     localStorage.setItem('buddly_reasoning', r);
   };
+  const [model, setModel] = useState<string>(
+    localStorage.getItem('buddly_model') ?? 'mistral-small-2506',
+  );
+  const setModelAndPersist = (m: string) => {
+    setModel(m);
+    localStorage.setItem('buddly_model', m);
+  };
+  const [ttsEnabled, setTtsEnabled] = useState<boolean>(
+    localStorage.getItem('buddly_tts') !== 'false',
+  );
+  const setTtsAndPersist = (v: boolean) => {
+    setTtsEnabled(v);
+    localStorage.setItem('buddly_tts', v ? 'true' : 'false');
+  };
+  const [temperature, setTemperature] = useState<number>(
+    parseFloat(localStorage.getItem('buddly_temp') ?? '0.8'),
+  );
+  const setTempAndPersist = (v: number) => {
+    setTemperature(v);
+    localStorage.setItem('buddly_temp', String(v));
+  };
+  const [ttsProvider, setTtsProvider] = useState<TtsProvider>(
+    savedTtsProvider(),
+  );
+  const setTtsProviderAndPersist = (v: TtsProvider) => {
+    setTtsProvider(v);
+    localStorage.setItem('buddly_tts_provider', v);
+  };
+
+  const [backendMode, setBackendMode] = useState<BackendMode>(savedBackendMode());
+  const [runpodUrl, setRunpodUrl] = useState<string>(savedRunpodUrl());
+  const setBackendModeAndPersist = (v: BackendMode) => {
+    setBackendMode(v);
+    localStorage.setItem('buddly_backend', v);
+  };
+  const setRunpodUrlAndPersist = (v: string) => {
+    setRunpodUrl(v);
+    localStorage.setItem('buddly_runpod_url', v);
+  };
+
+  const serverBase = backendMode === 'runpod' && runpodUrl ? runpodUrl : LOCAL_BASE;
+  const { ws: wsUrl, stt: sttUrl } = deriveUrls(serverBase);
+  const sttUrlRef = useRef(sttUrl);
+  sttUrlRef.current = sttUrl;
   const [latencies, setLatencies] = useState<LatencyEntry[]>([]);
   const [sttLatency, setSttLatency] = useState<number | null>(null);
-
-  const setModeAndPersist = (m: TtsMode) => {
-    setMode(m);
-    localStorage.setItem('buddly_mode', m);
-  };
+  const [analyticsOpen, setAnalyticsOpen] = useState(false);
+  const [usageHistory, setUsageHistory] = useState<TurnUsage[]>([]);
+  const [sessionStats, setSessionStats] = useState<{
+    promptTokens: number; completionTokens: number; turns: number; minutes: number;
+  } | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -153,7 +252,7 @@ export function App() {
 
     const connect = () => {
       if (cancelled) return;
-      const ws = new WebSocket(WS_URL);
+      const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -180,7 +279,11 @@ export function App() {
         }
         switch (msg.type) {
           case 'text_delta':
-            setAnswer((a) => a + msg.text);
+            setMessages((prev) => {
+              const last = prev[prev.length - 1];
+              if (!last || last.role !== 'assistant') return prev;
+              return [...prev.slice(0, -1), { ...last, content: last.content + msg.text }];
+            });
             setStatus((s) => (s === 'thinking' ? 'speaking' : s));
             break;
           case 'audio_chunk': {
@@ -195,7 +298,27 @@ export function App() {
           case 'latency':
             setLatencies((l) => [...l, { label: msg.label, ms: msg.ms }]);
             break;
+          case 'usage':
+            setUsageHistory((h) => [...h, {
+              turn: msg.sessionTurns,
+              ts: Date.now(),
+              model,
+              promptTokens: msg.promptTokens,
+              completionTokens: msg.completionTokens,
+            }]);
+            setSessionStats({
+              promptTokens: msg.sessionPromptTokens,
+              completionTokens: msg.sessionCompletionTokens,
+              turns: msg.sessionTurns,
+              minutes: msg.sessionMinutes,
+            });
+            break;
           case 'done':
+            setMessages((prev) => {
+              const last = prev[prev.length - 1];
+              if (!last || last.role !== 'assistant') return prev;
+              return [...prev.slice(0, -1), { ...last, pending: false }];
+            });
             setStatus('done');
             break;
           case 'error':
@@ -212,7 +335,11 @@ export function App() {
       if (retryTimer) window.clearTimeout(retryTimer);
       wsRef.current?.close();
     };
-  }, []);
+  }, [wsUrl]);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
 
   const sendText = (raw: string) => {
     const t = raw.trim();
@@ -221,13 +348,18 @@ export function App() {
     // User-Gesture: AudioContext anlegen/aufwecken, damit Autoplay greift.
     ensureAudioCtx();
 
-    setAnswer('');
+    setMessages((prev) => [
+      ...prev,
+      { role: 'user', content: t },
+      { role: 'assistant', content: '', pending: true },
+    ]);
     setError(null);
     setStatus('thinking');
     setLatencies([]);
+    setSttLatency(null);
     resetAudioPipeline();
 
-    wsRef.current.send(JSON.stringify({ type: 'user_text', text: t, mode, reasoning }));
+    wsRef.current.send(JSON.stringify({ type: 'user_text', text: t, reasoning, model, tts: ttsEnabled, temperature, ttsProvider }));
     setText('');
   };
 
@@ -272,7 +404,7 @@ export function App() {
           setTranscribing(true);
           setSttLatency(null);
           const sttStart = performance.now();
-          const res = await fetch(STT_URL, {
+          const res = await fetch(sttUrlRef.current, {
             method: 'POST',
             headers: { 'Content-Type': blob.type },
             body: blob,
@@ -325,7 +457,7 @@ export function App() {
 
   const resetConversation = () => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-    setAnswer('');
+    setMessages([]);
     setError(null);
     setStatus('idle');
     setLatencies([]);
@@ -334,79 +466,257 @@ export function App() {
     wsRef.current.send(JSON.stringify({ type: 'reset' }));
   };
 
+  const copyAnalyticsCsv = () => {
+    const header = 'Turn;Zeit;Modell;Prompt Tokens;Completion Tokens;Total Tokens;Kosten (USD)';
+    const rows = usageHistory.map((u) => {
+      const total = u.promptTokens + u.completionTokens;
+      const cost = ((u.promptTokens * PRICE_INPUT + u.completionTokens * PRICE_OUTPUT) / 1_000_000).toFixed(6);
+      const time = new Date(u.ts).toLocaleTimeString('de-DE');
+      return [u.turn, time, u.model, u.promptTokens, u.completionTokens, total, cost].join(';');
+    });
+    if (sessionStats) {
+      const total = sessionStats.promptTokens + sessionStats.completionTokens;
+      const cost = ((sessionStats.promptTokens * PRICE_INPUT + sessionStats.completionTokens * PRICE_OUTPUT) / 1_000_000).toFixed(6);
+      const perMin = sessionStats.minutes > 0 ? Math.round(total / sessionStats.minutes) : 0;
+      rows.push('');
+      rows.push(`Gesamt;;; ${sessionStats.promptTokens};${sessionStats.completionTokens};${total};${cost}`);
+      rows.push(`Tokens/min;;;;; ${perMin};`);
+    }
+    navigator.clipboard.writeText([header, ...rows].join('\n'));
+  };
+
   return (
-    <div className="app">
+    <main className="app-shell">
       <div className="header-row">
-        <h1>Buddlys Voice Demo</h1>
-        <button className="reset-btn" onClick={resetConversation} title="Gespräch löschen">
-          Neu starten
-        </button>
+        <div className="brand-lockup" aria-label="Buddlys">
+          <img className="brand-signet" src={signetUrl} alt="" />
+          <img className="brand-logo" src={logoUrl} alt="Buddlys" />
+        </div>
+        <div className="header-actions">
+          <button className="reset-btn" onClick={() => setAnalyticsOpen(true)} title="Analytics">
+            Analytics
+          </button>
+          <button className="reset-btn" onClick={() => setSettingsOpen(true)} title="Einstellungen">
+            Einstellungen
+          </button>
+          <button className="reset-btn" onClick={resetConversation} title="Gespräch löschen">
+            Neu starten
+          </button>
+        </div>
       </div>
       <div className="subtitle">
-        Streaming Chat + Voxtral TTS · Mistral{' '}
-        <code style={{ color: '#9aa0a6' }}>mistral-small-2506</code>
+        Mistral <code className="model-chip">{model}</code>
+        {' · '}
+        <code className="model-chip">
+          {!ttsEnabled ? 'kein Audio' : ttsProvider}
+        </code>
       </div>
 
-      <div className="mode-row">
-        <label className={`mode ${mode === 'full' ? 'active' : ''}`}>
-          <input
-            type="radio"
-            name="mode"
-            value="full"
-            checked={mode === 'full'}
-            onChange={() => setModeAndPersist('full')}
-          />
-          <span className="mode-title">Top-Qualität</span>
-          <span className="mode-desc">eine TTS-Generation, ~3 s Wartezeit</span>
-        </label>
-        <label className={`mode ${mode === 'streaming' ? 'active' : ''}`}>
-          <input
-            type="radio"
-            name="mode"
-            value="streaming"
-            checked={mode === 'streaming'}
-            onChange={() => setModeAndPersist('streaming')}
-          />
-          <span className="mode-title">Schnell (Streaming)</span>
-          <span className="mode-desc">Audio nach 1. Satz, Brüche möglich</span>
-        </label>
-      </div>
+      {settingsOpen && (
+        <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Einstellungen</h2>
+              <button className="modal-close" onClick={() => setSettingsOpen(false)} aria-label="Schließen">×</button>
+            </div>
 
-      <div className="mode-row reasoning-row">
-        <label className={`mode ${reasoning === 'auto' ? 'active' : ''}`}>
-          <input
-            type="radio"
-            name="reasoning"
-            value="auto"
-            checked={reasoning === 'auto'}
-            onChange={() => setReasoningAndPersist('auto')}
-          />
-          <span className="mode-title">Reasoning: Auto</span>
-          <span className="mode-desc">Modell entscheidet</span>
-        </label>
-        <label className={`mode ${reasoning === 'always' ? 'active' : ''}`}>
-          <input
-            type="radio"
-            name="reasoning"
-            value="always"
-            checked={reasoning === 'always'}
-            onChange={() => setReasoningAndPersist('always')}
-          />
-          <span className="mode-title">Immer</span>
-          <span className="mode-desc">erzwingt tiefes Nachdenken</span>
-        </label>
-        <label className={`mode ${reasoning === 'never' ? 'active' : ''}`}>
-          <input
-            type="radio"
-            name="reasoning"
-            value="never"
-            checked={reasoning === 'never'}
-            onChange={() => setReasoningAndPersist('never')}
-          />
-          <span className="mode-title">Nie</span>
-          <span className="mode-desc">schneller, weniger Tiefe</span>
-        </label>
-      </div>
+            <div className="modal-section">
+              <div className="modal-section-title">Modell</div>
+              <div className="mode-row">
+                {MODELS.map((m) => (
+                  <label key={m.id} className={`mode ${model === m.id ? 'active' : ''}`}>
+                    <input type="radio" name="model" value={m.id} checked={model === m.id}
+                      onChange={() => setModelAndPersist(m.id)} />
+                    <span className="mode-title">{m.label}</span>
+                    <span className="mode-desc">{m.desc}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div className="modal-section">
+              <div className="modal-section-title">Reasoning</div>
+              <div className="mode-row">
+                <label className={`mode ${reasoning === 'auto' ? 'active' : ''}`}>
+                  <input type="radio" name="reasoning" checked={reasoning === 'auto'}
+                    onChange={() => setReasoningAndPersist('auto')} />
+                  <span className="mode-title">Auto</span>
+                  <span className="mode-desc">Modell entscheidet</span>
+                </label>
+                <label className={`mode ${reasoning === 'always' ? 'active' : ''}`}>
+                  <input type="radio" name="reasoning" checked={reasoning === 'always'}
+                    onChange={() => setReasoningAndPersist('always')} />
+                  <span className="mode-title">Immer</span>
+                  <span className="mode-desc">tiefes Nachdenken</span>
+                </label>
+                <label className={`mode ${reasoning === 'never' ? 'active' : ''}`}>
+                  <input type="radio" name="reasoning" checked={reasoning === 'never'}
+                    onChange={() => setReasoningAndPersist('never')} />
+                  <span className="mode-title">Nie</span>
+                  <span className="mode-desc">schneller</span>
+                </label>
+              </div>
+            </div>
+
+            <div className="modal-section">
+              <div className="modal-section-title">Server</div>
+              <div className="mode-row">
+                <label className={`mode ${backendMode === 'local' ? 'active' : ''}`}>
+                  <input type="radio" name="backend" checked={backendMode === 'local'}
+                    onChange={() => setBackendModeAndPersist('local')} />
+                  <span className="mode-title">Lokal</span>
+                  <span className="mode-desc">localhost:3001</span>
+                </label>
+                <label className={`mode ${backendMode === 'runpod' ? 'active' : ''}`}>
+                  <input type="radio" name="backend" checked={backendMode === 'runpod'}
+                    onChange={() => setBackendModeAndPersist('runpod')} />
+                  <span className="mode-title">RunPod</span>
+                  <span className="mode-desc">Port 3000</span>
+                </label>
+              </div>
+              {backendMode === 'runpod' && (
+                <input
+                  type="text"
+                  placeholder="https://<pod-id>-3000.proxy.runpod.net"
+                  value={runpodUrl}
+                  onChange={(e) => setRunpodUrlAndPersist(e.target.value)}
+                  className="runpod-input"
+                />
+              )}
+            </div>
+
+            <div className="modal-section">
+              <div className="modal-section-title">TTS Provider</div>
+              <div className="mode-row">
+                <label className={`mode ${ttsEnabled && ttsProvider === 'cartesia' ? 'active' : ''}`}>
+                  <input type="radio" name="ttsprovider" checked={ttsEnabled && ttsProvider === 'cartesia'}
+                    onChange={() => { setTtsAndPersist(true); setTtsProviderAndPersist('cartesia'); }} />
+                  <span className="mode-title">Cartesia</span>
+                  <span className="mode-desc">Streaming WS</span>
+                </label>
+                <label className={`mode ${ttsEnabled && ttsProvider === 'mistral' ? 'active' : ''}`}>
+                  <input type="radio" name="ttsprovider" checked={ttsEnabled && ttsProvider === 'mistral'}
+                    onChange={() => { setTtsAndPersist(true); setTtsProviderAndPersist('mistral'); }} />
+                  <span className="mode-title">Mistral</span>
+                  <span className="mode-desc">Voxtral PCM</span>
+                </label>
+                <label className={`mode ${ttsEnabled && ttsProvider === 'omnivoice' ? 'active' : ''}`}>
+                  <input type="radio" name="ttsprovider" checked={ttsEnabled && ttsProvider === 'omnivoice'}
+                    onChange={() => { setTtsAndPersist(true); setTtsProviderAndPersist('omnivoice'); }} />
+                  <span className="mode-title">OmniVoice</span>
+                  <span className="mode-desc">RunPod</span>
+                </label>
+                <label className={`mode ${!ttsEnabled ? 'active' : ''}`}>
+                  <input type="radio" name="ttsprovider" checked={!ttsEnabled}
+                    onChange={() => setTtsAndPersist(false)} />
+                  <span className="mode-title">Kein Audio</span>
+                  <span className="mode-desc">nur Text</span>
+                </label>
+              </div>
+            </div>
+
+            <div className="modal-section">
+              <div className="modal-section-title">Temperature</div>
+              <label className="setting-item">
+                <span className="setting-label">Wert <strong>{temperature.toFixed(1)}</strong></span>
+                <input type="range" min="0" max="1.5" step="0.1" value={temperature}
+                  onChange={(e) => setTempAndPersist(parseFloat(e.target.value))} />
+                <span className="setting-hint">kreativ ↑</span>
+              </label>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {analyticsOpen && (
+        <div className="modal-backdrop" onClick={() => setAnalyticsOpen(false)}>
+          <div className="modal analytics-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Analytics</h2>
+              <button className="modal-close" onClick={() => setAnalyticsOpen(false)} aria-label="Schließen">×</button>
+            </div>
+
+            {sessionStats && (
+              <div className="analytics-summary">
+                <div className="analytics-stat">
+                  <span className="analytics-stat-label">Turns</span>
+                  <span className="analytics-stat-value">{sessionStats.turns}</span>
+                </div>
+                <div className="analytics-stat">
+                  <span className="analytics-stat-label">Prompt Tokens</span>
+                  <span className="analytics-stat-value">{sessionStats.promptTokens.toLocaleString('de-DE')}</span>
+                </div>
+                <div className="analytics-stat">
+                  <span className="analytics-stat-label">Completion Tokens</span>
+                  <span className="analytics-stat-value">{sessionStats.completionTokens.toLocaleString('de-DE')}</span>
+                </div>
+                <div className="analytics-stat">
+                  <span className="analytics-stat-label">Total</span>
+                  <span className="analytics-stat-value">{(sessionStats.promptTokens + sessionStats.completionTokens).toLocaleString('de-DE')}</span>
+                </div>
+                <div className="analytics-stat">
+                  <span className="analytics-stat-label">Tokens/min</span>
+                  <span className="analytics-stat-value">
+                    {sessionStats.minutes > 0 ? Math.round((sessionStats.promptTokens + sessionStats.completionTokens) / sessionStats.minutes).toLocaleString('de-DE') : '–'}
+                  </span>
+                </div>
+                <div className="analytics-stat">
+                  <span className="analytics-stat-label">Kosten</span>
+                  <span className="analytics-stat-value analytics-cost">
+                    ${((sessionStats.promptTokens * PRICE_INPUT + sessionStats.completionTokens * PRICE_OUTPUT) / 1_000_000).toFixed(5)}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {usageHistory.length === 0 ? (
+              <div className="analytics-empty">Noch keine Daten – führe ein Gespräch.</div>
+            ) : (
+              <div className="analytics-table-wrap">
+                <table className="analytics-table">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Zeit</th>
+                      <th>Modell</th>
+                      <th>Prompt</th>
+                      <th>Completion</th>
+                      <th>Total</th>
+                      <th>Kosten (USD)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {usageHistory.map((u, i) => {
+                      const total = u.promptTokens + u.completionTokens;
+                      const cost = (u.promptTokens * PRICE_INPUT + u.completionTokens * PRICE_OUTPUT) / 1_000_000;
+                      return (
+                        <tr key={i}>
+                          <td>{u.turn}</td>
+                          <td>{new Date(u.ts).toLocaleTimeString('de-DE')}</td>
+                          <td className="analytics-model">{u.model}</td>
+                          <td>{u.promptTokens.toLocaleString('de-DE')}</td>
+                          <td>{u.completionTokens.toLocaleString('de-DE')}</td>
+                          <td>{total.toLocaleString('de-DE')}</td>
+                          <td>${cost.toFixed(5)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            <div className="modal-footer">
+              <button className="reset-btn" onClick={copyAnalyticsCsv} disabled={usageHistory.length === 0}>
+                CSV kopieren (Excel)
+              </button>
+              <span className="analytics-price-hint">
+                Preise: ${PRICE_INPUT}/1M input · ${PRICE_OUTPUT}/1M output
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className={`status ${recording ? 'speaking' : transcribing ? 'thinking' : status}`}>
         {recording && 'hört zu …'}
@@ -418,8 +728,19 @@ export function App() {
         {!recording && !transcribing && status === 'error' && 'fehler'}
       </div>
 
-      <div className={`answer ${answer ? '' : 'empty'}`}>
-        {answer || 'Buddly-Antwort erscheint hier live …'}
+      <div className="chat-window">
+        {messages.length === 0 && (
+          <div className="chat-empty">
+            <img src={signetUrl} alt="" />
+            <span>Stell Buddly eine Frage …</span>
+          </div>
+        )}
+        {messages.map((msg, i) => (
+          <div key={i} className={`chat-msg chat-msg--${msg.role}${msg.pending ? ' chat-msg--pending' : ''}`}>
+            <span className="chat-bubble">{msg.content || (msg.pending ? '…' : '')}</span>
+          </div>
+        ))}
+        <div ref={chatEndRef} />
       </div>
 
       <div className="input-row">
@@ -430,7 +751,7 @@ export function App() {
           title={recording ? 'Stop' : 'Sprechen'}
           aria-label={recording ? 'Aufnahme stoppen' : 'Aufnahme starten'}
         >
-          {recording ? '■' : '🎤'}
+          {recording ? '■' : 'Mic'}
         </button>
         <input
           type="text"
@@ -484,6 +805,6 @@ export function App() {
           </div>
         ))}
       </div>
-    </div>
+    </main>
   );
 }
