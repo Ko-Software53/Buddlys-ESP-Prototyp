@@ -93,8 +93,8 @@ export function buildSystemPrompt(profile?: ChildProfile | null): string {
   const parts: string[] = [];
   const name = profile.child_name?.trim();
   const age = profile.child_age ?? null;
-  if (name && age) parts.push(`Das Kind heißt ${name} und ist ${age} Jahre alt. Sprich es ab und zu mit seinem Namen an und passe Wortwahl und Erklärtiefe an das Alter an.`);
-  else if (name) parts.push(`Das Kind heißt ${name}. Sprich es ab und zu mit seinem Namen an.`);
+  if (name && age) parts.push(`Das Kind heißt ${name} und ist ${age} Jahre alt. Benutze den Namen sehr selten — höchstens einmal pro Gespräch, nur wenn es sich wirklich natürlich anfühlt (z. B. zur Begrüßung oder bei echten Gefühlen). Passe Wortwahl und Erklärtiefe an das Alter an.`);
+  else if (name) parts.push(`Das Kind heißt ${name}. Benutze den Namen sehr selten — höchstens einmal pro Gespräch, nur wenn es sich wirklich natürlich anfühlt.`);
   else if (age) parts.push(`Das Kind ist ${age} Jahre alt. Passe Wortwahl und Erklärtiefe an dieses Alter an.`);
 
   const interests = (profile.interests ?? []).filter(Boolean);
