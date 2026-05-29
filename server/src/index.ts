@@ -91,6 +91,7 @@ interface TtsSession {
 }
 type ClientMsg =
   | { type: 'user_text'; text: string; reasoning?: ReasoningMode; model?: string; tts?: boolean; temperature?: number; ttsProvider?: TtsProvider; device_id?: string }
+  | { type: 'config'; device_id?: string; model?: string; reasoning?: ReasoningMode; tts?: boolean; ttsProvider?: TtsProvider }
   | { type: 'battery'; device_id: string; level: number }
   | { type: 'reset' };
 
@@ -158,43 +159,36 @@ wss.on('connection', (ws) => {
     convMessageCount = 0;
   };
 
-  ws.on('message', async (raw) => {
-    let msg: ClientMsg;
-    try {
-      msg = JSON.parse(raw.toString()) as ClientMsg;
-    } catch {
-      safeSend(ws, { type: 'error', message: 'invalid JSON' });
-      return;
-    }
-    if (msg?.type === 'reset') {
-      finalizeCurrent();
-      session.reset();
-      sessionPromptTokens = 0;
-      sessionCompletionTokens = 0;
-      sessionTurns = 0;
-      currentConversationId = null;
-      safeSend(ws, { type: 'done' });
-      return;
-    }
-    if (msg?.type === 'battery') {
-      if (msg.device_id && typeof msg.level === 'number' && Number.isFinite(msg.level)) {
-        void updateDeviceBattery(msg.device_id, msg.level);
-        console.log(`[battery] ${msg.device_id}: ${msg.level}%`);
-      }
-      return;
-    }
-    if (msg?.type !== 'user_text' || typeof msg.text !== 'string' || !msg.text.trim()) {
-      return;
-    }
+  // Per-connection turn defaults, set by a 'config' message from the device.
+  // Binary audio frames carry no metadata, so we remember model/reasoning/etc.
+  // here and apply them to every transcribed turn.
+  let turnCfg: {
+    model?: string;
+    reasoning?: ReasoningMode;
+    ttsProvider?: TtsProvider;
+    tts?: boolean;
+    device_id?: string;
+  } = {};
 
+  interface TurnParams {
+    text: string;
+    reasoning?: ReasoningMode;
+    model?: string;
+    temperature?: number;
+    tts?: boolean;
+    ttsProvider?: TtsProvider;
+    device_id?: string;
+  }
+
+  const handleTurn = async (p: TurnParams) => {
     // Resolve device config from Supabase if a hardware device_id was sent
-    if (msg.device_id && !deviceRowId) {
-      const dev = await getDeviceConfig(msg.device_id!);
+    if (p.device_id && !deviceRowId) {
+      const dev = await getDeviceConfig(p.device_id!);
       if (dev) {
         deviceRowId = dev.id;
         deviceOwnerId = dev.owner_id;
         session.setSystemPrompt(buildSystemPrompt(dev as ChildProfile));
-        void touchDevice(msg.device_id!);
+        void touchDevice(p.device_id!);
         console.log(`[supabase] device resolved: ${dev.id} (profile applied)`);
       }
     }
@@ -207,14 +201,14 @@ wss.on('connection', (ws) => {
     }
 
     const reasoning: ReasoningMode =
-      msg.reasoning === 'always' || msg.reasoning === 'never' ? msg.reasoning : 'auto';
-    const ttsEnabled = msg.tts !== false;
+      p.reasoning === 'always' || p.reasoning === 'never' ? p.reasoning : 'auto';
+    const ttsEnabled = p.tts !== false;
     const ttsProvider: TtsProvider =
-      msg.ttsProvider === 'omnivoice' || msg.ttsProvider === 'mistral'
-        ? msg.ttsProvider
+      p.ttsProvider === 'omnivoice' || p.ttsProvider === 'mistral'
+        ? p.ttsProvider
         : 'cartesia';
-    const model = msg.model || undefined;
-    const temperature = typeof msg.temperature === 'number' ? Math.min(1.5, Math.max(0, msg.temperature)) : undefined;
+    const model = p.model || undefined;
+    const temperature = typeof p.temperature === 'number' ? Math.min(1.5, Math.max(0, p.temperature)) : undefined;
     const t0 = Date.now();
     let firstTokenLogged = false;
     let firstAudioLogged = false;
@@ -280,7 +274,7 @@ wss.on('connection', (ws) => {
     };
 
     // Persist user message
-    void appendMessage(currentConversationId!, 'user', msg.text);
+    void appendMessage(currentConversationId!, 'user', p.text);
     if (currentConversationId) { convMessageCount++; lastActivityAt = Date.now(); }
 
     let assistantText = '';
@@ -296,7 +290,7 @@ wss.on('connection', (ws) => {
         else if (isFinal) tts!.send(' ', true);
       };
 
-      for await (const ev of session.send(msg.text, { reasoning, model, temperature })) {
+      for await (const ev of session.send(p.text, { reasoning, model, temperature })) {
         if (ev.type === 'delta') {
           if (!firstTokenLogged) {
             firstTokenLogged = true;
@@ -378,6 +372,78 @@ wss.on('connection', (ws) => {
     } finally {
       (tts as TtsSession | null)?.close();
     }
+  };
+
+  // STT for device audio sent over the WebSocket as a binary WAV frame. Reuses
+  // the persistent connection, so the device pays no per-turn TLS handshake
+  // (the old HTTPS /stt POST opened a fresh TLS connection on every turn).
+  const handleAudio = async (wav: Buffer) => {
+    const t0 = Date.now();
+    let text = '';
+    try {
+      text = await transcribeAudio(wav, 'audio/wav');
+    } catch (err) {
+      console.error('[stt-ws]', err);
+      safeSend(ws, { type: 'error', message: (err as Error).message });
+      return;
+    }
+    console.log(`[stt-ws] ${Date.now() - t0}ms  "${text}"`);
+    if (!text.trim()) { safeSend(ws, { type: 'done' }); return; }
+    await handleTurn({ text, ...turnCfg });
+  };
+
+  ws.on('message', async (raw, isBinary) => {
+    if (isBinary) {
+      await handleAudio(raw as Buffer);
+      return;
+    }
+    let msg: ClientMsg;
+    try {
+      msg = JSON.parse(raw.toString()) as ClientMsg;
+    } catch {
+      safeSend(ws, { type: 'error', message: 'invalid JSON' });
+      return;
+    }
+    if (msg?.type === 'reset') {
+      finalizeCurrent();
+      session.reset();
+      sessionPromptTokens = 0;
+      sessionCompletionTokens = 0;
+      sessionTurns = 0;
+      currentConversationId = null;
+      safeSend(ws, { type: 'done' });
+      return;
+    }
+    if (msg?.type === 'battery') {
+      if (msg.device_id && typeof msg.level === 'number' && Number.isFinite(msg.level)) {
+        void updateDeviceBattery(msg.device_id, msg.level);
+        console.log(`[battery] ${msg.device_id}: ${msg.level}%`);
+      }
+      return;
+    }
+    if (msg?.type === 'config') {
+      turnCfg = {
+        model: msg.model,
+        reasoning: msg.reasoning,
+        ttsProvider: msg.ttsProvider,
+        tts: msg.tts,
+        device_id: msg.device_id,
+      };
+      console.log(`[config] device=${msg.device_id ?? '?'} model=${msg.model ?? 'default'} tts=${msg.ttsProvider ?? 'cartesia'}`);
+      return;
+    }
+    if (msg?.type !== 'user_text' || typeof msg.text !== 'string' || !msg.text.trim()) {
+      return;
+    }
+    await handleTurn({
+      text: msg.text,
+      reasoning: msg.reasoning,
+      model: msg.model,
+      temperature: msg.temperature,
+      tts: msg.tts,
+      ttsProvider: msg.ttsProvider,
+      device_id: msg.device_id,
+    });
   });
 
   ws.on('close', () => {

@@ -9,7 +9,6 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "nvs_flash.h"
-#include "esp_http_client.h"
 #include "esp_websocket_client.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
@@ -32,6 +31,7 @@ static EventGroupHandle_t s_wifi_eg;
 
 static esp_websocket_client_handle_t s_ws = NULL;
 static bool s_ws_connected = false;
+static volatile bool s_config_sent = false;
 static bool s_recording    = false;
 static int16_t *s_rec_buf  = NULL;
 static size_t   s_rec_samples = 0;
@@ -51,7 +51,7 @@ static volatile bool     s_stream_active     = false;
 static int      s_talk_mode        = TALK_MODE_DEFAULT;
 
 #define JITTER_BUF_SAMPLES  (MIC_SAMPLE_RATE * 8)
-#define JITTER_PREBUF_MS    50
+#define JITTER_PREBUF_MS    400   // prebuffer before playback starts; absorbs WAN/TLS jitter (was 50 — too small over the internet)
 static int16_t       *s_jbuf    = NULL;
 static volatile size_t s_jbuf_wr = 0;
 static volatile size_t s_jbuf_rd = 0;
@@ -333,24 +333,17 @@ static void make_wav_header(uint8_t *h, uint32_t pcm_bytes)
     memcpy(h+40,  &pcm_bytes, 4);
 }
 
-// ─── STT HTTP POST ────────────────────────────────────────────────────────
+// ─── STT over WebSocket ─────────────────────────────────────────────────────
+// Send the recorded utterance as a WAV inside a binary WS frame. The server
+// transcribes it and runs the turn on the same persistent connection, so there
+// is no per-turn TLS handshake. The old approach opened a fresh HTTPS /stt
+// connection every turn — once the server moved to a remote host, that
+// per-turn TLS handshake (slow on the ESP32) became the dominant latency.
 
-typedef struct { char buf[2048]; int len; } http_resp_ctx_t;
-
-static esp_err_t stt_http_event(esp_http_client_event_t *evt)
+static void send_audio_ws(const int16_t *pcm, size_t samples)
 {
-    http_resp_ctx_t *ctx = (http_resp_ctx_t *)evt->user_data;
-    if (evt->event_id == HTTP_EVENT_ON_DATA && ctx) {
-        int space = (int)sizeof(ctx->buf) - ctx->len - 1;
-        int take  = evt->data_len < space ? evt->data_len : space;
-        memcpy(ctx->buf + ctx->len, evt->data, take);
-        ctx->len += take;
-    }
-    return ESP_OK;
-}
+    if (!s_ws_connected || !s_ws) return;
 
-static char *post_wav_get_text(const int16_t *pcm, size_t samples)
-{
     size_t pcm_bytes = samples * sizeof(int16_t);
     size_t body_len  = 44 + pcm_bytes;
 
@@ -358,72 +351,41 @@ static char *post_wav_get_text(const int16_t *pcm, size_t samples)
     if (!body) body = malloc(body_len);
     if (!body) {
         ESP_LOGE(TAG, "OOM for WAV body (%u bytes)", (unsigned)body_len);
-        return NULL;
+        return;
     }
     make_wav_header(body, pcm_bytes);
     memcpy(body + 44, pcm, pcm_bytes);
 
-    // Port 443 → TLS (e.g. Railway); anything else stays plain http (local dev).
-    bool tls = (s_srv_port == 443);
-    char url[256];
-    snprintf(url, sizeof(url), "%s://%s:%d%s",
-             tls ? "https" : "http", s_srv_host, s_srv_port, STT_PATH);
-
-    http_resp_ctx_t ctx = {0};
-    esp_http_client_config_t cfg = {
-        .url              = url,
-        .method           = HTTP_METHOD_POST,
-        .timeout_ms       = 30000,
-        .buffer_size      = 2048,
-        .buffer_size_tx   = 4096,
-        .event_handler    = stt_http_event,
-        .user_data        = &ctx,
-        .crt_bundle_attach = tls ? esp_crt_bundle_attach : NULL,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    esp_http_client_set_header(client, "Content-Type", "audio/wav");
-    esp_http_client_set_post_field(client, (const char *)body, body_len);
-
-    esp_err_t err = esp_http_client_perform(client);
+    int sent = esp_websocket_client_send_bin(s_ws, (const char *)body,
+                                             (int)body_len, pdMS_TO_TICKS(10000));
     free(body);
-    esp_http_client_cleanup(client);
 
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "STT HTTP error: %s", esp_err_to_name(err));
-        return NULL;
+    if (sent < 0) {
+        ESP_LOGE(TAG, "WS audio send failed");
+        return;
     }
-    ctx.buf[ctx.len] = '\0';
-    ESP_LOGI(TAG, "STT response: %.200s", ctx.buf);
-
-    cJSON *root = cJSON_Parse(ctx.buf);
-    if (!root) { ESP_LOGE(TAG, "STT JSON parse failed"); return NULL; }
-    cJSON *text_item = cJSON_GetObjectItem(root, "text");
-    char *text = NULL;
-    if (cJSON_IsString(text_item) && text_item->valuestring[0])
-        text = strdup(text_item->valuestring);
-    cJSON_Delete(root);
-    return text;
+    s_thinking_since_ms = now_ms();
+    ESP_LOGI(TAG, "→ WS audio: %u bytes", (unsigned)body_len);
 }
 
 // ─── WebSocket ───────────────────────────────────────────────────────────
 
-static void send_user_text(const char *text)
+// Tell the server the per-device turn settings once per connection. Binary
+// audio frames carry no metadata, so the server remembers these and applies
+// them to every transcribed turn.
+static void send_config(void)
 {
     if (!s_ws_connected || !s_ws) return;
 
     char *msg = NULL;
     asprintf(&msg,
-        "{\"type\":\"user_text\",\"text\":\"%s\","
-        "\"reasoning\":\"%s\",\"model\":\"%s\","
-        "\"tts\":true,\"ttsProvider\":\"%s\","
-        "\"device_id\":\"%s\"}",
-        text, BUDDLY_REASONING, BUDDLY_MODEL, BUDDLY_TTS_PROVIDER,
-        ble_prov_device_id());
+        "{\"type\":\"config\",\"device_id\":\"%s\",\"model\":\"%s\","
+        "\"reasoning\":\"%s\",\"tts\":true,\"ttsProvider\":\"%s\"}",
+        ble_prov_device_id(), BUDDLY_MODEL, BUDDLY_REASONING, BUDDLY_TTS_PROVIDER);
     if (!msg) return;
 
-    ESP_LOGI(TAG, "→ WS: %s", msg);
+    ESP_LOGI(TAG, "→ WS config: %s", msg);
     esp_websocket_client_send_text(s_ws, msg, strlen(msg), pdMS_TO_TICKS(3000));
-    s_thinking_since_ms = now_ms();
     free(msg);
 }
 
@@ -512,6 +474,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base,
             s_ws_connected  = false;
             s_stream_active = false;
             s_ws_buf_len    = 0;
+            s_config_sent   = false;   // re-send config after reconnect
             break;
         case WEBSOCKET_EVENT_DATA:
             if (ev->op_code == 0x8) break;
@@ -715,12 +678,8 @@ static void stop_and_send(void)
     if (peak < 50) { ESP_LOGW(TAG, "Mic silent"); return; }
     if (s_rec_samples < (size_t)(MIC_SAMPLE_RATE / 2)) { ESP_LOGW(TAG, "Too short"); return; }
 
-    char *text = post_wav_get_text(s_rec_buf, s_rec_samples);
+    send_audio_ws(s_rec_buf, s_rec_samples);
     s_rec_samples = 0;
-    if (!text) return;
-    ESP_LOGI(TAG, "STT: \"%s\"", text);
-    if (strlen(text) > 0) send_user_text(text);
-    free(text);
 }
 
 // ─── VAD capture ──────────────────────────────────────────────────────────
@@ -917,10 +876,34 @@ void app_main(void)
     while (1) {
         handle_power_button();
 
+        // Send per-device config once after each (re)connect so the server can
+        // run binary-audio turns with the right model/voice/device_id.
+        if (s_ws_connected && !s_config_sent) {
+            send_config();
+            s_config_sent = true;
+        }
+
         if (BATTERY_REPORT_ENABLED && s_ws_connected &&
             (s_last_batt_ms == 0 || now_ms() - s_last_batt_ms >= BATTERY_REPORT_MS)) {
             send_battery();
             s_last_batt_ms = now_ms();
+        }
+
+        // Half-duplex: while Buddly is speaking (plus a short echo-tail), do not
+        // touch the microphone. The mic and speaker share one I2S codec, so
+        // reading the mic during playback both starves the speaker (stuttering)
+        // and feeds the speaker's own output back in as "speech" (echo loop, no
+        // AEC on this board). Buttons stay responsive; capture resumes once
+        // playback ends.
+        bool playing_back = s_stream_active ||
+                            (now_ms() - s_last_speaking_ms) < VAD_SUPPRESS_MS;
+        if (playing_back) {
+            if (s_recording)   { s_recording = false; s_rec_samples = 0; }
+            s_vad_in_speech    = false;
+            s_silence_since_ms = 0;
+            last_pressed       = false;
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
         }
 
         if (s_talk_mode == 1) {
