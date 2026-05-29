@@ -376,7 +376,7 @@ export async function* runConversation(
       allowTools: round < 3,
     });
 
-    let result: InternalTurnResult = { toolCalls: null, contentBuffer: '' };
+    let result: InternalTurnResult = { toolCalls: null, contentBuffer: '', promptTokens: 0, completionTokens: 0 };
     while (true) {
       const next = await turn.next();
       if (next.done) {
