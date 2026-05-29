@@ -78,6 +78,17 @@ export default function Conversations() {
               onPress={() => router.push(`/(main)/device/${devices[0].id}`)}
             >
               <Text style={{ fontSize: 20 }}>⚙️</Text>
+              {devices[0].battery_level != null && (
+                <Text style={[styles.batteryBadge, {
+                  color: devices[0].battery_level >= 50
+                    ? theme.colors.success
+                    : devices[0].battery_level >= 20
+                    ? '#F0A500'
+                    : theme.colors.danger,
+                }]}>
+                  {devices[0].battery_level}%
+                </Text>
+              )}
             </TouchableOpacity>
           )}
           <TouchableOpacity style={styles.iconBtn} onPress={signOut}>
@@ -138,7 +149,8 @@ const styles = StyleSheet.create({
   },
   brandRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   title: { fontSize: 28, fontWeight: '800', color: theme.colors.text },
-  iconBtn: { padding: 6, backgroundColor: theme.colors.surface, borderRadius: theme.radius.sm, borderWidth: 1, borderColor: theme.colors.border },
+  iconBtn: { padding: 6, paddingHorizontal: 10, backgroundColor: theme.colors.surface, borderRadius: theme.radius.sm, borderWidth: 1, borderColor: theme.colors.border, alignItems: 'center' },
+  batteryBadge: { fontSize: 10, fontWeight: '700', marginTop: 1 },
   center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   emptyDevices: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 40, gap: 12 },
   emptyTitle: { fontSize: 20, fontWeight: '700', color: theme.colors.text, textAlign: 'center' },

@@ -21,7 +21,8 @@ fs.watchFile(envPath, { interval: 500 }, (curr, prev) => {
 });
 
 import { WebSocketServer, WebSocket } from 'ws';
-import { ConversationSession } from './mistralChat.js';
+import { ConversationSession, buildSystemPrompt, type ChildProfile } from './mistralChat.js';
+import { classifyConversation } from './analytics.js';
 import { transcribeAudio } from './mistralStt.js';
 import { openCartesiaSession } from './cartesiaTts.js';
 import { openMistralTtsSession } from './mistralTts.js';
@@ -29,7 +30,7 @@ import { openOmniVoiceSession } from './omnivoiceTts.js';
 import { SentenceChunker } from './chunker.js';
 import { preloadFillers, pickFiller } from './fillerCache.js';
 import { spellOutNumbers } from './numberToWords.js';
-import { getDeviceConfig, touchDevice, createConversation, appendMessage } from './supabase.js';
+import { getDeviceConfig, touchDevice, updateDeviceBattery, createConversation, appendMessage, finalizeConversation, tagConversation } from './supabase.js';
 
 const PORT = Number(process.env.PORT) || 3001;
 
@@ -90,6 +91,7 @@ interface TtsSession {
 }
 type ClientMsg =
   | { type: 'user_text'; text: string; reasoning?: ReasoningMode; model?: string; tts?: boolean; temperature?: number; ttsProvider?: TtsProvider; device_id?: string }
+  | { type: 'battery'; device_id: string; level: number }
   | { type: 'reset' };
 
 function safeSend(ws: WebSocket, payload: unknown) {
@@ -127,6 +129,35 @@ wss.on('connection', (ws) => {
   let deviceRowId: string | null = null;
   let deviceOwnerId: string | null = null;
 
+  // Per-conversation analytics state
+  let convStartedAt = 0;
+  let lastActivityAt = 0;
+  let convMessageCount = 0;
+
+  // Finalize the current conversation: persist duration + message count, then
+  // tag it with topics/summary (best-effort, fire-and-forget). Reads the session
+  // transcript, so call BEFORE session.reset() clears history.
+  const finalizeCurrent = () => {
+    if (!currentConversationId) return;
+    const id = currentConversationId;
+    const startedAt = convStartedAt || sessionStart;
+    const durationSeconds = Math.max(0, ((lastActivityAt || Date.now()) - startedAt) / 1000);
+    const messageCount = convMessageCount;
+    const transcript = session.history
+      .filter((m) => (m.role === 'user' || m.role === 'assistant') && !!m.content)
+      .map((m) => `${m.role === 'user' ? 'Kind' : 'Buddly'}: ${m.content}`)
+      .join('\n');
+
+    void finalizeConversation(id, { durationSeconds, messageCount });
+    if (transcript.trim()) {
+      void classifyConversation(transcript).then((ins) => {
+        if (ins) void tagConversation(id, ins.topics, ins.summary);
+      });
+    }
+    currentConversationId = null;
+    convMessageCount = 0;
+  };
+
   ws.on('message', async (raw) => {
     let msg: ClientMsg;
     try {
@@ -136,12 +167,20 @@ wss.on('connection', (ws) => {
       return;
     }
     if (msg?.type === 'reset') {
+      finalizeCurrent();
       session.reset();
       sessionPromptTokens = 0;
       sessionCompletionTokens = 0;
       sessionTurns = 0;
       currentConversationId = null;
       safeSend(ws, { type: 'done' });
+      return;
+    }
+    if (msg?.type === 'battery') {
+      if (msg.device_id && typeof msg.level === 'number' && Number.isFinite(msg.level)) {
+        void updateDeviceBattery(msg.device_id, msg.level);
+        console.log(`[battery] ${msg.device_id}: ${msg.level}%`);
+      }
       return;
     }
     if (msg?.type !== 'user_text' || typeof msg.text !== 'string' || !msg.text.trim()) {
@@ -154,14 +193,17 @@ wss.on('connection', (ws) => {
       if (dev) {
         deviceRowId = dev.id;
         deviceOwnerId = dev.owner_id;
+        session.setSystemPrompt(buildSystemPrompt(dev as ChildProfile));
         void touchDevice(msg.device_id!);
-        console.log(`[supabase] device resolved: ${dev.id}`);
+        console.log(`[supabase] device resolved: ${dev.id} (profile applied)`);
       }
     }
 
     // Start a new conversation in Supabase for this turn session
     if (!currentConversationId && deviceRowId && deviceOwnerId) {
       currentConversationId = await createConversation(deviceRowId, deviceOwnerId);
+      convStartedAt = Date.now();
+      convMessageCount = 0;
     }
 
     const reasoning: ReasoningMode =
@@ -239,6 +281,7 @@ wss.on('connection', (ws) => {
 
     // Persist user message
     void appendMessage(currentConversationId!, 'user', msg.text);
+    if (currentConversationId) { convMessageCount++; lastActivityAt = Date.now(); }
 
     let assistantText = '';
 
@@ -324,6 +367,7 @@ wss.on('connection', (ws) => {
       // Persist assistant reply
       if (assistantText.trim()) {
         void appendMessage(currentConversationId!, 'assistant', assistantText.trim());
+        if (currentConversationId) { convMessageCount++; lastActivityAt = Date.now(); }
       }
 
       sendLatency(ws, 'total', Date.now() - t0);
@@ -336,7 +380,10 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('close', () => console.log('[ws] client disconnected'));
+  ws.on('close', () => {
+    finalizeCurrent();
+    console.log('[ws] client disconnected');
+  });
 });
 
 server.listen(PORT, () => {

@@ -7,10 +7,10 @@
 #define WIFI_SSID           ""
 #define WIFI_PASSWORD       ""
 
-#define SERVER_HOST         ""
-#define SERVER_PORT         3001
+#define SERVER_HOST         "buddlys-esp-prototyp-production.up.railway.app"
+#define SERVER_PORT         443
 #define STT_PATH            "/stt"
-#define WS_URI              ""
+#define WS_URI              "/ws"
 
 #define BUDDLY_MODEL        "mistral-small-2506"
 #define BUDDLY_TTS_PROVIDER "cartesia"
@@ -51,10 +51,19 @@
 
 // VAD settings — thresholds are in post-software-gain RMS units
 #define VAD_SPEECH_THRESHOLD    1200  // RMS to trigger speech onset
-#define VAD_SILENCE_THRESHOLD   200   // RMS below this counts as silence
-#define VAD_SILENCE_MS          600   // consecutive silence ms to end turn
+#define VAD_CONTINUE_THRESHOLD  600   // RMS to keep an active turn alive; below this counts toward end-of-turn silence
+#define VAD_SILENCE_MS          300   // ms below the continue threshold before the turn ends
 #define VAD_PREROLL_MS          200   // ms of audio captured before onset
 #define VAD_SUPPRESS_MS         500   // brief echo tail after last sample; s_stream_active covers playback
+
+// --- Battery reporting ---
+// The device reports its battery charge (0–100 %) to the server over the WS
+// connection; the server stores it in Supabase and the app shows it.
+// No battery-sense hardware is wired yet, so this is OFF by default. To enable:
+//   1. Implement battery_read_percent() in main.c (ADC divider or I2C gauge).
+//   2. Set BATTERY_REPORT_ENABLED to 1.
+#define BATTERY_REPORT_ENABLED  0
+#define BATTERY_REPORT_MS       60000  // how often to report while connected
 
 // Power button gestures
 #define POWER_BTN_LONG_MS       1000  // hold duration to toggle talk mode

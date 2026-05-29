@@ -68,6 +68,51 @@ const SYSTEM_PROMPT = [
   'nicht nachschauen kannst, und schlage vor, später nochmal zu fragen.',
 ].join(' ');
 
+/** Child profile fields used to personalize the system prompt. */
+export interface ChildProfile {
+  child_name?: string | null;
+  child_age?: number | null;
+  interests?: string[] | null;
+  avoid_topics?: string[] | null;
+  learning_goals?: string[] | null;
+  personality?: string | null;
+}
+
+const PERSONALITY_HINT: Record<string, string> = {
+  playful: 'Sei besonders verspielt, albern und voller Quatsch.',
+  calm: 'Sei besonders ruhig, sanft und beruhigend.',
+  curious: 'Sei besonders neugierig und stell die Welt als großes Abenteuer dar.',
+  funny: 'Sei besonders witzig und bring das Kind oft zum Lachen.',
+  gentle: 'Sei besonders warm, geduldig und behutsam.',
+};
+
+/** Returns SYSTEM_PROMPT with a personalized "Kind-Kontext" block appended.
+ *  Falls back to the plain SYSTEM_PROMPT when no profile data is present. */
+export function buildSystemPrompt(profile?: ChildProfile | null): string {
+  if (!profile) return SYSTEM_PROMPT;
+  const parts: string[] = [];
+  const name = profile.child_name?.trim();
+  const age = profile.child_age ?? null;
+  if (name && age) parts.push(`Das Kind heißt ${name} und ist ${age} Jahre alt. Sprich es ab und zu mit seinem Namen an und passe Wortwahl und Erklärtiefe an das Alter an.`);
+  else if (name) parts.push(`Das Kind heißt ${name}. Sprich es ab und zu mit seinem Namen an.`);
+  else if (age) parts.push(`Das Kind ist ${age} Jahre alt. Passe Wortwahl und Erklärtiefe an dieses Alter an.`);
+
+  const interests = (profile.interests ?? []).filter(Boolean);
+  if (interests.length) parts.push(`Es interessiert sich besonders für: ${interests.join(', ')}. Greife diese Themen gern auf und nutze sie für Beispiele.`);
+
+  const goals = (profile.learning_goals ?? []).filter(Boolean);
+  if (goals.length) parts.push(`Wenn es natürlich ins Gespräch passt, fördere spielerisch: ${goals.join(', ')}. Dräng es nie auf.`);
+
+  const personality = profile.personality?.trim();
+  if (personality && PERSONALITY_HINT[personality]) parts.push(PERSONALITY_HINT[personality]);
+
+  const avoid = (profile.avoid_topics ?? []).filter(Boolean);
+  if (avoid.length) parts.push(`Vermeide diese Themen strikt: ${avoid.join(', ')}. Kommt das Kind darauf, lenke freundlich und unauffällig auf etwas anderes, ohne zu erschrecken oder zu belehren.`);
+
+  if (!parts.length) return SYSTEM_PROMPT;
+  return SYSTEM_PROMPT + ' Hier ein paar persönliche Infos über dieses Kind: ' + parts.join(' ');
+}
+
 const CHAT_URL = 'https://api.mistral.ai/v1/chat/completions';
 
 interface MistralMessage {
@@ -272,7 +317,20 @@ export class ConversationSession {
 
   /** Kompletter Reset (z. B. wenn das Kind "neu anfangen" sagt). */
   reset(): void {
-    this.messages = [{ role: 'system', content: SYSTEM_PROMPT }];
+    this.messages = [{ role: 'system', content: this.systemPrompt }];
+  }
+
+  private systemPrompt: string = SYSTEM_PROMPT;
+
+  /** Replace the system prompt (e.g. once the device's child profile resolves).
+   *  Safe to call before the first turn; later resets keep the new prompt. */
+  setSystemPrompt(prompt: string): void {
+    this.systemPrompt = prompt;
+    if (this.messages.length && this.messages[0].role === 'system') {
+      this.messages[0] = { role: 'system', content: prompt };
+    } else {
+      this.messages.unshift({ role: 'system', content: prompt });
+    }
   }
 
   /** Aktuelle History für Debug. */
@@ -376,7 +434,7 @@ export async function* runConversation(
       allowTools: round < 3,
     });
 
-    let result: InternalTurnResult = { toolCalls: null, contentBuffer: '' };
+    let result: InternalTurnResult = { toolCalls: null, contentBuffer: '', promptTokens: 0, completionTokens: 0 };
     while (true) {
       const next = await turn.next();
       if (next.done) {

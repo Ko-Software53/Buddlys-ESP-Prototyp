@@ -29,9 +29,9 @@ const styles = StyleSheet.create({
   signetFrame: {
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 8,
-    backgroundColor: '#FFFFFF',
-    borderWidth: 1,
-    borderColor: '#C9DDF4',
+    borderRadius: 12,
+    backgroundColor: '#D6E9FF',
+    borderWidth: 1.5,
+    borderColor: '#9FC3EB',
   },
 });

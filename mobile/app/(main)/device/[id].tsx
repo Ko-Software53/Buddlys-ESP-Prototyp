@@ -36,6 +36,19 @@ export default function DeviceConfig() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
+  const batteryIcon = (level: number) => {
+    if (level >= 80) return '🔋';
+    if (level >= 50) return '🔋';
+    if (level >= 20) return '🪫';
+    return '🪫';
+  };
+
+  const batteryColor = (level: number) => {
+    if (level >= 50) return theme.colors.success;
+    if (level >= 20) return '#F0A500';
+    return theme.colors.danger;
+  };
+
   useEffect(() => {
     (async () => {
       const { data } = await supabase.from('devices').select('*').eq('id', id).single();
@@ -94,6 +107,15 @@ export default function DeviceConfig() {
             placeholder="z. B. Mein Buddly"
             placeholderTextColor={theme.colors.textSoft}
           />
+        </Section>
+
+        <Section title="Kind-Profil">
+          <TouchableOpacity
+            style={styles.wifiBtn}
+            onPress={() => router.push({ pathname: '/(main)/profile/[deviceId]', params: { deviceId: id } })}
+          >
+            <Text style={styles.wifiBtnText}>Kind-Profil bearbeiten</Text>
+          </TouchableOpacity>
         </Section>
 
         <Section title="KI-Modell">
@@ -162,6 +184,42 @@ export default function DeviceConfig() {
           </View>
           <Text style={styles.sliderHint}>Niedrig = präzise · Hoch = kreativ</Text>
         </Section>
+
+        <Section title="WLAN & Verbindung">
+          {device?.wifi_ssid ? (
+            <View style={styles.infoRow}>
+              <Text style={styles.infoLabel}>Verbunden mit</Text>
+              <Text style={styles.infoValue}>{device.wifi_ssid}</Text>
+            </View>
+          ) : null}
+          <TouchableOpacity
+            style={styles.wifiBtn}
+            onPress={() => router.push({ pathname: '/(main)/discover', params: { reconfigure: '1' } })}
+          >
+            <Text style={styles.wifiBtnText}>WLAN neu konfigurieren</Text>
+          </TouchableOpacity>
+        </Section>
+
+        {device?.battery_level != null && (
+          <Section title="Akku">
+            <View style={styles.batteryRow}>
+              <View style={styles.batteryBarBg}>
+                <View style={[styles.batteryBarFill, {
+                  width: `${device.battery_level}%` as any,
+                  backgroundColor: batteryColor(device.battery_level),
+                }]} />
+              </View>
+              <Text style={[styles.batteryText, { color: batteryColor(device.battery_level) }]}>
+                {batteryIcon(device.battery_level)} {device.battery_level}%
+              </Text>
+            </View>
+            {device.last_seen_at && (
+              <Text style={styles.batteryHint}>
+                Zuletzt gesehen: {new Date(device.last_seen_at).toLocaleString('de-DE', { dateStyle: 'short', timeStyle: 'short' })}
+              </Text>
+            )}
+          </Section>
+        )}
 
         <View style={{ paddingHorizontal: 20, marginTop: 8 }}>
           <TouchableOpacity
@@ -232,4 +290,14 @@ const styles = StyleSheet.create({
   saveBtn: { backgroundColor: theme.colors.primary, borderRadius: theme.radius.lg, paddingVertical: 16, alignItems: 'center', ...shadow },
   saveBtnDisabled: { opacity: 0.5 },
   saveBtnText: { color: theme.colors.white, fontWeight: '700', fontSize: 16 },
+  infoRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 10, paddingHorizontal: 14, backgroundColor: theme.colors.surface, borderRadius: theme.radius.md, borderWidth: 1, borderColor: theme.colors.border, marginBottom: 10 },
+  infoLabel: { fontSize: 14, color: theme.colors.textMuted },
+  infoValue: { fontSize: 14, fontWeight: '700', color: theme.colors.text },
+  wifiBtn: { backgroundColor: theme.colors.surface, borderRadius: theme.radius.md, paddingVertical: 14, alignItems: 'center', borderWidth: 1.5, borderColor: theme.colors.primary },
+  wifiBtnText: { color: theme.colors.primary, fontWeight: '700', fontSize: 15 },
+  batteryRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  batteryBarBg: { flex: 1, height: 12, backgroundColor: theme.colors.backgroundDeep, borderRadius: 6, overflow: 'hidden' },
+  batteryBarFill: { height: '100%', borderRadius: 6 },
+  batteryText: { fontSize: 15, fontWeight: '700', minWidth: 60 },
+  batteryHint: { fontSize: 12, color: theme.colors.textSoft, marginTop: 6 },
 });

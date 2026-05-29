@@ -55,7 +55,11 @@ export default function WifiSetup() {
         // Subscribe to status notifications (WiFi connection result)
         statusSubRef.current = subscribeToStatus(raw, async (status) => {
           if (status.wifi === 'connected') {
-            await registerDevice();
+            const reg = await registerDevice();
+            if (reg && !reg.onboarded) {
+              router.replace({ pathname: '/(main)/onboarding/[deviceId]', params: { deviceId: reg.id } });
+              return;
+            }
             setStep('done');
           } else if (status.wifi === 'failed') {
             setErrorMsg('Verbindung fehlgeschlagen. Passwort prüfen.');
@@ -77,29 +81,35 @@ export default function WifiSetup() {
     };
   }, []);
 
-  const registerDevice = async () => {
-    if (!user || !hardwareId) return;
+  const registerDevice = async (): Promise<{ id: string; onboarded: boolean } | null> => {
+    if (!user || !hardwareId) return null;
     const { data } = await supabase
       .from('devices')
-      .select('id')
+      .select('id, onboarded_at')
       .eq('device_id', hardwareId)
       .maybeSingle();
-    if (!data) {
-      await supabase.from('devices').insert({
+    if (data) {
+      return { id: data.id, onboarded: data.onboarded_at != null };
+    }
+    const { data: created } = await supabase
+      .from('devices')
+      .insert({
         device_id: hardwareId,
         owner_id: user.id,
         name: deviceName || 'Mein Buddly',
-      });
-    }
+      })
+      .select('id')
+      .single();
+    return created ? { id: created.id, onboarded: false } : null;
   };
 
   const sendCredentials = async () => {
     if (!selected || !connectedDevice) return;
     setStep('connecting');
     try {
-      // Server host: in production this comes from app config or your deployed URL
-      const serverHost = Constants.expoConfig?.extra?.serverHost ?? '192.168.2.84';
-      const serverPort = 3001;
+      // Server host/port come from app.json `extra` (Railway by default).
+      const serverHost = Constants.expoConfig?.extra?.serverHost ?? 'buddlys-esp-prototyp-production.up.railway.app';
+      const serverPort = Constants.expoConfig?.extra?.serverPort ?? 443;
       await sendWifiCredentials(connectedDevice, selected.ssid, password, serverHost, serverPort);
     } catch (e) {
       setErrorMsg((e as Error).message);

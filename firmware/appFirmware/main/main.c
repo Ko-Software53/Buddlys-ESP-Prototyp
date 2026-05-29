@@ -17,6 +17,7 @@
 #include "esp_codec_dev.h"
 #include "codec_init.h"
 #include "mbedtls/base64.h"
+#include "esp_crt_bundle.h"
 #include "cJSON.h"
 #include "settings.h"
 #include "nvs_config.h"
@@ -43,6 +44,7 @@ static size_t   s_ws_buf_len = 0;
 static volatile uint32_t s_thinking_since_ms = 0;
 static volatile uint32_t s_last_speaking_ms  = 0;
 static volatile uint32_t s_error_until_ms    = 0;
+static uint32_t          s_last_batt_ms      = 0;
 static volatile bool     s_drain_jbuf        = false;
 static volatile bool     s_stream_active     = false;
 
@@ -243,10 +245,19 @@ static void play_pcm16_mono(const uint8_t *pcm, size_t byte_len)
     if (!s_jbuf) return;
     const int16_t *mono = (const int16_t *)pcm;
     size_t n = byte_len / sizeof(int16_t);
-    for (size_t i = 0; i < n; i++) {
+    for (size_t i = 0; i < n; ) {
         size_t next = (s_jbuf_wr + 1) % JITTER_BUF_SAMPLES;
-        if (next == s_jbuf_rd) break;
-        s_jbuf[s_jbuf_wr] = mono[i];
+        if (next == s_jbuf_rd) {
+            // Buffer full: TTS streams faster than realtime, so on long
+            // replies the producer outruns playback. Wait for the playback
+            // task to drain instead of dropping samples — dropped PCM is what
+            // turns long replies into garbled noise. This throttles WS intake
+            // to realtime. Abandon the rest if a barge-in flushed the buffer.
+            if (s_drain_jbuf) return;
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        s_jbuf[s_jbuf_wr] = mono[i++];
         __asm__ volatile("memw" ::: "memory");
         s_jbuf_wr = next;
     }
@@ -352,18 +363,22 @@ static char *post_wav_get_text(const int16_t *pcm, size_t samples)
     make_wav_header(body, pcm_bytes);
     memcpy(body + 44, pcm, pcm_bytes);
 
+    // Port 443 → TLS (e.g. Railway); anything else stays plain http (local dev).
+    bool tls = (s_srv_port == 443);
     char url[256];
-    snprintf(url, sizeof(url), "http://%s:%d%s", s_srv_host, s_srv_port, STT_PATH);
+    snprintf(url, sizeof(url), "%s://%s:%d%s",
+             tls ? "https" : "http", s_srv_host, s_srv_port, STT_PATH);
 
     http_resp_ctx_t ctx = {0};
     esp_http_client_config_t cfg = {
-        .url            = url,
-        .method         = HTTP_METHOD_POST,
-        .timeout_ms     = 30000,
-        .buffer_size    = 2048,
-        .buffer_size_tx = 4096,
-        .event_handler  = stt_http_event,
-        .user_data      = &ctx,
+        .url              = url,
+        .method           = HTTP_METHOD_POST,
+        .timeout_ms       = 30000,
+        .buffer_size      = 2048,
+        .buffer_size_tx   = 4096,
+        .event_handler    = stt_http_event,
+        .user_data        = &ctx,
+        .crt_bundle_attach = tls ? esp_crt_bundle_attach : NULL,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     esp_http_client_set_header(client, "Content-Type", "audio/wav");
@@ -409,6 +424,33 @@ static void send_user_text(const char *text)
     ESP_LOGI(TAG, "→ WS: %s", msg);
     esp_websocket_client_send_text(s_ws, msg, strlen(msg), pdMS_TO_TICKS(3000));
     s_thinking_since_ms = now_ms();
+    free(msg);
+}
+
+// Returns the battery charge as 0–100 %, or -1 if unknown/unavailable.
+// TODO: implement the real measurement once battery-sense hardware exists.
+//   • ADC voltage divider: configure the ADC unit/channel, read mV, map the
+//     battery voltage range (e.g. 3.30 V→0 %, 4.20 V→100 %) to a percentage.
+//   • I2C fuel gauge (e.g. MAX17048): read the SOC register directly.
+// Until then this returns -1 so no placeholder value is ever reported.
+static int battery_read_percent(void)
+{
+    return -1;
+}
+
+static void send_battery(void)
+{
+    if (!s_ws_connected || !s_ws) return;
+    int pct = battery_read_percent();
+    if (pct < 0) return;            // unknown — never report a fake value
+    if (pct > 100) pct = 100;
+
+    char *msg = NULL;
+    asprintf(&msg,
+        "{\"type\":\"battery\",\"device_id\":\"%s\",\"level\":%d}",
+        ble_prov_device_id(), pct);
+    if (!msg) return;
+    esp_websocket_client_send_text(s_ws, msg, strlen(msg), pdMS_TO_TICKS(3000));
     free(msg);
 }
 
@@ -498,6 +540,9 @@ static void ws_connect(const char *uri)
         .buffer_size          = 4096,
         .reconnect_timeout_ms = 10000,
         .network_timeout_ms   = 10000,
+        // Verify the server cert against the built-in CA bundle for wss://.
+        // Ignored for plain ws:// URIs, so it's safe to always attach.
+        .crt_bundle_attach    = esp_crt_bundle_attach,
     };
     s_ws = esp_websocket_client_init(&cfg);
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY,
@@ -755,18 +800,20 @@ static void vad_capture_chunk(void)
             return;
         }
 
-        if (energy < VAD_SILENCE_THRESHOLD) {
-            if (s_silence_since_ms == 0) {
-                s_silence_since_ms = now_ms();
-            } else if (now_ms() - s_silence_since_ms >= VAD_SILENCE_MS) {
-                ESP_LOGI(TAG, "VAD: end of speech (rms=%d)", energy);
-                s_vad_in_speech  = false;
-                s_preroll_head   = 0;
-                s_preroll_full   = false;
-                stop_and_send();
-            }
-        } else {
+        // Keep the turn alive only while we still hear speech-level energy.
+        // Anything below VAD_CONTINUE_THRESHOLD (room noise, trailing breath)
+        // counts toward silence, so the mic releases ~VAD_SILENCE_MS after the
+        // child actually stops talking instead of being held open by ambient noise.
+        if (energy >= VAD_CONTINUE_THRESHOLD) {
             s_silence_since_ms = 0;
+        } else if (s_silence_since_ms == 0) {
+            s_silence_since_ms = now_ms();
+        } else if (now_ms() - s_silence_since_ms >= VAD_SILENCE_MS) {
+            ESP_LOGI(TAG, "VAD: end of speech (rms=%d)", energy);
+            s_vad_in_speech  = false;
+            s_preroll_head   = 0;
+            s_preroll_full   = false;
+            stop_and_send();
         }
     }
 }
@@ -856,7 +903,8 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Server config: host=%s port=%d", s_srv_host, s_srv_port);
     char ws_uri[192];
-    snprintf(ws_uri, sizeof(ws_uri), "ws://%s:%d/ws", s_srv_host, s_srv_port);
+    snprintf(ws_uri, sizeof(ws_uri), "%s://%s:%d/ws",
+             s_srv_port == 443 ? "wss" : "ws", s_srv_host, s_srv_port);
     ESP_LOGI(TAG, "Connecting WS: %s", ws_uri);
     ws_connect(ws_uri);
 
@@ -868,6 +916,12 @@ void app_main(void)
 
     while (1) {
         handle_power_button();
+
+        if (BATTERY_REPORT_ENABLED && s_ws_connected &&
+            (s_last_batt_ms == 0 || now_ms() - s_last_batt_ms >= BATTERY_REPORT_MS)) {
+            send_battery();
+            s_last_batt_ms = now_ms();
+        }
 
         if (s_talk_mode == 1) {
             vad_capture_chunk();

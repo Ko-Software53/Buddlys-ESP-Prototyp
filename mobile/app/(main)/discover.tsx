@@ -4,7 +4,7 @@ import {
   ActivityIndicator, Alert, Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { router } from 'expo-router';
+import { router, useLocalSearchParams } from 'expo-router';
 import { PermissionsAndroid } from 'react-native';
 import {
   waitForBleReady, scanForBuddlys, connectToBuddly,
@@ -19,6 +19,7 @@ type ScanState = 'idle' | 'scanning' | 'connecting' | 'error';
 
 export default function Discover() {
   const { user } = useAuth();
+  const { reconfigure } = useLocalSearchParams<{ reconfigure?: string }>();
   const [scanState, setScanState] = useState<ScanState>('idle');
   const [devices, setDevices] = useState<BuddlyDevice[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -86,14 +87,14 @@ export default function Discover() {
       const connected = await connectToBuddly(found.raw);
       const status = await readDeviceStatus(connected);
 
-      // If already connected to WiFi, register device & go to conversations
-      if (status.wifi === 'connected') {
+      // If already connected to WiFi and not in reconfigure mode, skip wifi setup
+      if (status.wifi === 'connected' && !reconfigure) {
         await ensureDeviceRegistered(status.device_id, found.name);
         router.replace('/(main)/conversations');
         return;
       }
 
-      // Needs provisioning
+      // Needs provisioning or user wants to change WiFi
       router.push({
         pathname: '/(main)/wifi-setup',
         params: { deviceId: found.id, deviceName: found.name, hardwareId: status.device_id },
@@ -133,8 +134,8 @@ export default function Discover() {
         <View style={styles.brandRow}>
           <BrandSignet size={44} />
           <View>
-            <Text style={styles.title}>Suche Buddlys</Text>
-            <Text style={styles.subtitle}>in der Nähe</Text>
+            <Text style={styles.title}>{reconfigure ? 'WLAN ändern' : 'Suche Buddlys'}</Text>
+            <Text style={styles.subtitle}>{reconfigure ? 'Buddly suchen & neu verbinden' : 'in der Nähe'}</Text>
           </View>
         </View>
       </View>

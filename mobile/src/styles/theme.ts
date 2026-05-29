@@ -19,9 +19,9 @@ export const theme = {
     white: '#FFFFFF',
   },
   radius: {
-    sm: 6,
-    md: 8,
-    lg: 8,
+    sm: 8,
+    md: 12,
+    lg: 16,
   },
   spacing: {
     screen: 20,

@@ -27,6 +27,13 @@ export default function MainLayout() {
       }}
     >
       <Tabs.Screen
+        name="dashboard"
+        options={{
+          title: 'Übersicht',
+          tabBarIcon: ({ focused }) => <TabIcon label="📊" focused={focused} />,
+        }}
+      />
+      <Tabs.Screen
         name="discover"
         options={{
           title: 'Verbinden',
@@ -44,6 +51,8 @@ export default function MainLayout() {
       <Tabs.Screen name="wifi-setup" options={{ href: null }} />
       <Tabs.Screen name="conversation/[id]" options={{ href: null }} />
       <Tabs.Screen name="device/[id]" options={{ href: null }} />
+      <Tabs.Screen name="onboarding/[deviceId]" options={{ href: null }} />
+      <Tabs.Screen name="profile/[deviceId]" options={{ href: null }} />
     </Tabs>
   );
 }

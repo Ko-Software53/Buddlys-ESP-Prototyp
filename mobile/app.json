@@ -4,10 +4,12 @@
     "slug": "buddlys-app",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "icon": "./assets/logo-buddlys-signet-blue.png",
     "scheme": "buddlys",
     "userInterfaceStyle": "light",
     "splash": {
+      "image": "./assets/logo-buddlys-signet-blue.png",
+      "resizeMode": "contain",
       "backgroundColor": "#F4F9FF"
     },
     "ios": {
@@ -20,7 +22,7 @@
     },
     "android": {
       "adaptiveIcon": {
-        "foregroundImage": "./assets/icon.png",
+        "foregroundImage": "./assets/logo-buddlys-signet-blue.png",
         "backgroundColor": "#F4F9FF"
       },
       "package": "de.buddlys.app",
@@ -50,6 +52,10 @@
     ],
     "experiments": {
       "typedRoutes": true
+    },
+    "extra": {
+      "serverHost": "buddlys-esp-prototyp-production.up.railway.app",
+      "serverPort": 443
     }
   }
 }
