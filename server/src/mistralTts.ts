@@ -40,7 +40,12 @@ const FORMAT_MIME: Record<string, string> = {
   pcm: 'audio/pcm',
 };
 
-export const MISTRAL_TTS_SAMPLE_RATE = 24000;
+// Voxtral liefert float32-PCM @ 24 kHz. Die Firmware spielt aber fix mit 16 kHz
+// ab und ignoriert das gesendete sampleRate-Feld — ungewandelt klingt die Stimme
+// dadurch ~0,67× zu langsam und zu tief. Deshalb resamplen wir serverseitig auf
+// 16 kHz und melden 16 kHz als sampleRate.
+const MISTRAL_NATIVE_RATE = 24000;
+export const MISTRAL_TTS_SAMPLE_RATE = 16000;
 export const MISTRAL_TTS_ENCODING = 'pcm_s16le' as const;
 
 const UUID_RE =
@@ -113,17 +118,44 @@ function base64AudioFromEvent(json: Record<string, unknown>): string | null {
   return typeof value === 'string' ? value : null;
 }
 
+// Resampled PCM16 per linearer Interpolation. Pro Chunk eigenständig — bei
+// Sprache ist der Nahtfehler an Chunk-Grenzen (<1 Sample) unhörbar.
+function resampleS16(samples: Int16Array, fromRate: number, toRate: number): Buffer {
+  const n = samples.length;
+  if (n === 0) return Buffer.alloc(0);
+  if (fromRate === toRate) {
+    const out = Buffer.allocUnsafe(n * 2);
+    for (let i = 0; i < n; i++) out.writeInt16LE(samples[i], i * 2);
+    return out;
+  }
+  const outLen = Math.max(1, Math.round((n * toRate) / fromRate));
+  const out = Buffer.allocUnsafe(outLen * 2);
+  const step = outLen > 1 ? (n - 1) / (outLen - 1) : 0;
+  for (let i = 0; i < outLen; i++) {
+    const pos = i * step;
+    const idx = Math.floor(pos);
+    const frac = pos - idx;
+    const a = samples[idx] ?? 0;
+    const b = idx + 1 < n ? samples[idx + 1] : a;
+    let v = Math.round(a + (b - a) * frac);
+    if (v > 32767) v = 32767;
+    else if (v < -32768) v = -32768;
+    out.writeInt16LE(v, i * 2);
+  }
+  return out;
+}
+
 function f32leToS16le(input: Buffer): { pcm: Buffer; remainder: Buffer } {
   const sampleCount = Math.floor(input.length / 4);
-  const pcm = Buffer.allocUnsafe(sampleCount * 2);
+  const s16 = new Int16Array(sampleCount);
 
   for (let i = 0; i < sampleCount; i++) {
     const f = input.readFloatLE(i * 4);
     const clamped = Math.max(-1, Math.min(1, Number.isFinite(f) ? f : 0));
-    const int = clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);
-    pcm.writeInt16LE(int, i * 2);
+    s16[i] = clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);
   }
 
+  const pcm = resampleS16(s16, MISTRAL_NATIVE_RATE, MISTRAL_TTS_SAMPLE_RATE);
   return { pcm, remainder: input.subarray(sampleCount * 4) };
 }
 

@@ -95,6 +95,15 @@ LLM (Mistral) replies → server streams TTS audio back → toy plays it. Half-d
   a signal instead of silence. If "toy won't talk," FIRST probe `/ws` (config+user_text,
   count audio chunks) and check the requested `ttsProvider` is keyed/enabled in `.env`.
   As of last check BOTH cartesia and mistral return audio fine from production.
+- **TTS sample rate MUST be 16 kHz — the firmware ignores the `sampleRate` field.**
+  `playback_task` (main.c) always plays at `SPK_SAMPLE_RATE 16000` and never reads the
+  `sampleRate` the server sends in `audio_chunk`. So any provider must emit 16 kHz PCM or
+  the voice pitch/speed is wrong: Voxtral/Mistral natively returns float32 @ **24 kHz**,
+  which at 16 kHz playback sounds **deep & slow (~0.67×)**. Fixed 2026-05-30: `mistralTts.ts`
+  now resamples 24 kHz→16 kHz in `f32leToS16le`/`resampleS16` and reports
+  `MISTRAL_TTS_SAMPLE_RATE = 16000`. Cartesia was already configured to 16 kHz
+  (`PCM_SAMPLE_RATE` in cartesiaTts.ts). If you add a new TTS provider, output 16 kHz mono
+  s16le or resample server-side. (NOTE: live only after Railway redeploy.)
 - **Stuttering = jitter-buffer underrun, not a code bug.** `playback_task` (main.c) pads
   with silence when audio arrives slower than realtime (WAN/TLS jitter, slow TTS).
   `JITTER_PREBUF_MS` (settings.h, ~400ms) is the cushion. "Works sometimes, stutters
