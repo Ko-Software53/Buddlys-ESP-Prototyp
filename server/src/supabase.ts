@@ -68,11 +68,27 @@ export async function tagConversation(
   conversationId: string,
   topics: string[],
   summary: string,
+  useCase?: string,
 ) {
+  if (!supabase || !conversationId) return;
+  const patch: Record<string, unknown> = {
+    topics: topics.slice(0, 3),
+    summary: summary.slice(0, 500),
+  };
+  if (useCase) patch.use_case = useCase;
+  await supabase
+    .from('conversations')
+    .update(patch)
+    .eq('id', conversationId);
+}
+
+/** Marks a conversation as auto-flagged (a heuristic spotted a broken dialog).
+ *  Best-effort; never throws. Does NOT touch a manual educator flag. */
+export async function flagConversation(conversationId: string, reason: string) {
   if (!supabase || !conversationId) return;
   await supabase
     .from('conversations')
-    .update({ topics: topics.slice(0, 3), summary: summary.slice(0, 500) })
+    .update({ flagged: true, auto_flagged: true, flag_reason: reason.slice(0, 300) })
     .eq('id', conversationId);
 }
 

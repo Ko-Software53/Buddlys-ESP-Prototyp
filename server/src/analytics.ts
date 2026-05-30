@@ -5,14 +5,30 @@ const CHAT_URL = 'https://api.mistral.ai/v1/chat/completions';
 export interface ConversationInsights {
   topics: string[];
   summary: string;
+  /** Coarse primary use case, one of USE_CASES (or '' if unclear). */
+  useCase: string;
 }
+
+/** Allowed use-case buckets so the dashboard can aggregate cleanly. */
+export const USE_CASES = [
+  'Lernen',
+  'Geschichten',
+  'Spielen',
+  'Gefühle',
+  'Wissensfragen',
+  'Smalltalk',
+  'Einschlafen',
+  'Sonstiges',
+] as const;
 
 const CLASSIFY_PROMPT =
   'Du analysierst ein Gespräch zwischen einem Kind und einem Sprachspielzeug. ' +
-  'Gib ausschließlich ein JSON-Objekt mit genau zwei Feldern zurück: ' +
+  'Gib ausschließlich ein JSON-Objekt mit genau drei Feldern zurück: ' +
   '"topics" (Array aus 1 bis 3 kurzen deutschen Themenschlagwörtern, z. B. "Dinosaurier", ' +
-  '"Mathe", "Gefühle") und "summary" (ein einziger kurzer deutscher Satz für die Eltern, der ' +
-  'zusammenfasst, worüber gesprochen wurde). Keine weiteren Felder, kein Markdown.';
+  '"Mathe", "Gefühle"), "summary" (ein einziger kurzer deutscher Satz für die Eltern, der ' +
+  'zusammenfasst, worüber gesprochen wurde) und "useCase" (genau einer dieser Werte, der den ' +
+  'Hauptzweck des Gesprächs beschreibt: ' + USE_CASES.join(', ') + '). ' +
+  'Keine weiteren Felder, kein Markdown.';
 
 /** Tags a finished conversation with 1–3 topics + a one-line summary via a cheap
  *  Mistral call. Returns null on any failure (caller treats analytics as best-effort). */
@@ -50,7 +66,7 @@ export async function classifyConversation(
     const content = data?.choices?.[0]?.message?.content;
     if (typeof content !== 'string') return null;
 
-    const parsed = JSON.parse(content) as { topics?: unknown; summary?: unknown };
+    const parsed = JSON.parse(content) as { topics?: unknown; summary?: unknown; useCase?: unknown };
     const topics = Array.isArray(parsed.topics)
       ? parsed.topics
           .filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
@@ -58,8 +74,13 @@ export async function classifyConversation(
           .slice(0, 3)
       : [];
     const summary = typeof parsed.summary === 'string' ? parsed.summary.trim() : '';
+    // Snap the model's useCase onto an allowed bucket (case-insensitive); fall
+    // back to '' so the dashboard can group unknowns separately.
+    const rawUseCase = typeof parsed.useCase === 'string' ? parsed.useCase.trim() : '';
+    const useCase =
+      USE_CASES.find((u) => u.toLowerCase() === rawUseCase.toLowerCase()) ?? '';
     if (!topics.length && !summary) return null;
-    return { topics, summary };
+    return { topics, summary, useCase };
   } catch (e) {
     console.error('[analytics] classify failed:', (e as Error).message);
     return null;

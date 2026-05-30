@@ -30,7 +30,7 @@ import { openOmniVoiceSession } from './omnivoiceTts.js';
 import { SentenceChunker } from './chunker.js';
 import { preloadFillers, pickFiller } from './fillerCache.js';
 import { spellOutNumbers } from './numberToWords.js';
-import { getDeviceConfig, touchDevice, updateDeviceBattery, createConversation, appendMessage, finalizeConversation, tagConversation } from './supabase.js';
+import { getDeviceConfig, touchDevice, updateDeviceBattery, createConversation, appendMessage, finalizeConversation, tagConversation, flagConversation } from './supabase.js';
 
 const PORT = Number(process.env.PORT) || 3001;
 
@@ -141,6 +141,9 @@ wss.on('connection', (ws) => {
   let convStartedAt = 0;
   let lastActivityAt = 0;
   let convMessageCount = 0;
+  // Set when a turn expected speech but emitted no audio (TTS provider failed).
+  // Used by finalizeCurrent's heuristic to auto-flag a broken dialog.
+  let convHadTtsError = false;
 
   // Finalize the current conversation: persist duration + message count, then
   // tag it with topics/summary (best-effort, fire-and-forget). Reads the session
@@ -159,11 +162,23 @@ wss.on('connection', (ws) => {
     void finalizeConversation(id, { durationSeconds, messageCount });
     if (transcript.trim()) {
       void classifyConversation(transcript).then((ins) => {
-        if (ins) void tagConversation(id, ins.topics, ins.summary);
+        if (ins) void tagConversation(id, ins.topics, ins.summary, ins.useCase);
       });
     }
+
+    // Auto-flag broken dialogs so educators can spot them. Heuristics:
+    //  - a TTS failure left the toy mute this conversation, or
+    //  - the child spoke but got essentially no exchange (≤1 message), or
+    //  - a real exchange happened yet was extremely short (likely a misfire).
+    const reasons: string[] = [];
+    if (convHadTtsError) reasons.push('TTS lieferte kein Audio (Spielzeug stumm)');
+    if (messageCount <= 1) reasons.push('Kein echter Dialog (≤1 Nachricht)');
+    else if (durationSeconds < 5) reasons.push('Sehr kurzer Dialog (<5s)');
+    if (reasons.length) void flagConversation(id, reasons.join('; '));
+
     currentConversationId = null;
     convMessageCount = 0;
+    convHadTtsError = false;
   };
 
   // Per-connection turn defaults, set by a 'config' message from the device.
@@ -209,6 +224,7 @@ wss.on('connection', (ws) => {
       currentConversationId = await createConversation(deviceRowId, deviceOwnerId);
       convStartedAt = Date.now();
       convMessageCount = 0;
+      convHadTtsError = false;
     }
 
     const reasoning: ReasoningMode =
@@ -383,6 +399,7 @@ wss.on('connection', (ws) => {
       // won't talk" undiagnosable before.
       if (ttsEnabled && !firstAudioLogged && assistantText.trim()) {
         console.error(`[tts] no audio emitted for provider=${ttsProvider} — text was "${assistantText.slice(0, 60)}"`);
+        convHadTtsError = true;
         safeSend(ws, { type: 'error', message: `tts produced no audio (${ttsProvider})` });
       }
 
