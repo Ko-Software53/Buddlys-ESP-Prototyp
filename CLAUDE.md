@@ -108,6 +108,14 @@ LLM (Mistral) replies → server streams TTS audio back → toy plays it. Half-d
   with silence when audio arrives slower than realtime (WAN/TLS jitter, slow TTS).
   `JITTER_PREBUF_MS` (settings.h, ~400ms) is the cushion. "Works sometimes, stutters
   other times" almost always means the TTS provider / network is the variable, not the FW.
+- **Stutter+high latency ONLY after deep-sleep wake, cured by factory-reset (FIXED 2026-05-30).**
+  Root cause was RF state, not logic: deep-sleep wake restores only PARTIAL RF calibration; a
+  marginal stored cal → weak/noisy link → retransmits → latency+stutter. A 5-press factory
+  reset cleared it only because it ends in a full `esp_restart()` cold boot (full recal). Fix
+  in `app_main` (main.c): on `ESP_SLEEP_WAKEUP_EXT0` call `esp_phy_erase_cal_data_in_nvs()`
+  before `init_board()`/`esp_wifi_init` so wake does a FULL recalibration like a cold boot.
+  ALSO set `esp_wifi_set_ps(WIFI_PS_NONE)` in `wifi_driver_init` — default `WIFI_PS_MIN_MODEM`
+  parks the radio between beacons and adds 100–300 ms jitter spikes to streamed audio.
 - **Half-duplex.** While speaking (+`VAD_SUPPRESS_MS` echo tail) the mic is ignored on
   purpose (no AEC). Don't "fix" the mic going dead during playback — it's intentional.
 - The server's `.env` `MISTRAL_MODEL` may be a reasoning model (e.g. `magistral-*`), but

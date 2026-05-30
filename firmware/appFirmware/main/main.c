@@ -12,6 +12,7 @@
 #include "esp_websocket_client.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
+#include "esp_phy_init.h"
 #include "driver/gpio.h"
 #include "esp_codec_dev.h"
 #include "codec_init.h"
@@ -171,6 +172,12 @@ static void wifi_driver_init(void)
 
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_start();
+
+    // Realtime audio streaming can't tolerate modem sleep: the default
+    // WIFI_PS_MIN_MODEM parks the radio between DTIM beacons, adding 100–300 ms
+    // latency spikes and jitter that show up as stuttering playback. Keep the
+    // radio always on.
+    esp_wifi_set_ps(WIFI_PS_NONE);
 }
 
 #define WIFI_CONNECT_TIMEOUT_MS  15000
@@ -789,6 +796,17 @@ void app_main(void)
     }
 
     led_init();
+
+    // After deep sleep the chip wakes with only PARTIAL RF calibration to save
+    // wake time. With a marginal stored calibration that yields a weak/noisy
+    // link → retransmissions → high latency and stuttering audio, until a full
+    // power cycle / factory-reset reboot recalibrates. Erase the stored cal data
+    // on a deep-sleep wake so esp_wifi_init() below does a FULL recalibration,
+    // making the wake path behave like a clean cold boot.
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+        ESP_LOGI(TAG, "Deep-sleep wake — forcing full RF recalibration");
+        esp_phy_erase_cal_data_in_nvs();
+    }
 
     extern void init_board(void);
     init_board();
