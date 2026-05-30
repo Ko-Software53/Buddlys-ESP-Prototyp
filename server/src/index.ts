@@ -130,6 +130,13 @@ wss.on('connection', (ws) => {
   let deviceRowId: string | null = null;
   let deviceOwnerId: string | null = null;
 
+  // Per-device overrides from the Supabase `devices` row (set by the app).
+  // These take priority over the device-sent `config` frame so the app — not the
+  // hardcoded firmware settings.h — controls the toy's tts/model. Cached for
+  // the connection; the toy picks up app changes on its next (re)connect.
+  let deviceTtsProvider: TtsProvider | undefined;
+  let deviceModel: string | undefined;
+
   // Per-conversation analytics state
   let convStartedAt = 0;
   let lastActivityAt = 0;
@@ -188,8 +195,12 @@ wss.on('connection', (ws) => {
         deviceRowId = dev.id;
         deviceOwnerId = dev.owner_id;
         session.setSystemPrompt(buildSystemPrompt(dev as ChildProfile));
+        // App-selected overrides (devices.tts_provider / model columns).
+        const tp = dev.tts_provider as string | undefined;
+        if (tp === 'cartesia' || tp === 'mistral' || tp === 'omnivoice') deviceTtsProvider = tp;
+        if (typeof dev.model === 'string' && dev.model.trim()) deviceModel = dev.model.trim();
         void touchDevice(p.device_id!);
-        console.log(`[supabase] device resolved: ${dev.id} (profile applied)`);
+        console.log(`[supabase] device resolved: ${dev.id} (profile applied, tts=${deviceTtsProvider ?? '—'} model=${deviceModel ?? '—'})`);
       }
     }
 
@@ -203,11 +214,13 @@ wss.on('connection', (ws) => {
     const reasoning: ReasoningMode =
       p.reasoning === 'always' || p.reasoning === 'never' ? p.reasoning : 'auto';
     const ttsEnabled = p.tts !== false;
+    // App selection (Supabase) wins over the device-sent config frame.
+    const requestedProvider = deviceTtsProvider ?? p.ttsProvider;
     const ttsProvider: TtsProvider =
-      p.ttsProvider === 'omnivoice' || p.ttsProvider === 'mistral'
-        ? p.ttsProvider
+      requestedProvider === 'omnivoice' || requestedProvider === 'mistral'
+        ? requestedProvider
         : 'cartesia';
-    const model = p.model || undefined;
+    const model = deviceModel ?? p.model ?? undefined;
     const temperature = typeof p.temperature === 'number' ? Math.min(1.5, Math.max(0, p.temperature)) : undefined;
     const t0 = Date.now();
     let firstTokenLogged = false;
@@ -362,6 +375,15 @@ wss.on('connection', (ws) => {
       if (assistantText.trim()) {
         void appendMessage(currentConversationId!, 'assistant', assistantText.trim());
         if (currentConversationId) { convMessageCount++; lastActivityAt = Date.now(); }
+      }
+
+      // Surface silent TTS failures: if speech was expected but no audio frame
+      // ever went out, the provider failed/was swallowed. Tell the device so it
+      // shows an error (red) instead of sitting mute — this is what made "toy
+      // won't talk" undiagnosable before.
+      if (ttsEnabled && !firstAudioLogged && assistantText.trim()) {
+        console.error(`[tts] no audio emitted for provider=${ttsProvider} — text was "${assistantText.slice(0, 60)}"`);
+        safeSend(ws, { type: 'error', message: `tts produced no audio (${ttsProvider})` });
       }
 
       sendLatency(ws, 'total', Date.now() - t0);

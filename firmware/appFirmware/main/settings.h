@@ -13,7 +13,7 @@
 #define WS_URI              "/ws"
 
 #define BUDDLY_MODEL        "mistral-small-2506"
-#define BUDDLY_TTS_PROVIDER "cartesia"
+#define BUDDLY_TTS_PROVIDER "mistral"
 #define BUDDLY_REASONING    "never"
 
 // Push-to-talk: AI key, digital GPIO 47, active low.
