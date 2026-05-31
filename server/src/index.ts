@@ -93,10 +93,35 @@ type ClientMsg =
   | { type: 'user_text'; text: string; reasoning?: ReasoningMode; model?: string; tts?: boolean; temperature?: number; ttsProvider?: TtsProvider; device_id?: string }
   | { type: 'config'; device_id?: string; model?: string; reasoning?: ReasoningMode; tts?: boolean; ttsProvider?: TtsProvider }
   | { type: 'battery'; device_id: string; level: number }
+  | { type: 'audio_start' }
+  | { type: 'audio_end' }
+  | { type: 'audio_cancel' }
   | { type: 'reset' };
 
 function safeSend(ws: WebSocket, payload: unknown) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(payload));
+}
+
+/** Wrap raw PCM (default 16 kHz mono s16le, what the device streams) in a 44-byte
+ *  WAV header so the existing STT path can treat it like any other audio file. */
+function pcmToWav(pcm: Buffer, sampleRate = 16000, channels = 1, bits = 16): Buffer {
+  const byteRate = (sampleRate * channels * bits) / 8;
+  const blockAlign = (channels * bits) / 8;
+  const h = Buffer.alloc(44);
+  h.write('RIFF', 0);
+  h.writeUInt32LE(36 + pcm.length, 4);
+  h.write('WAVE', 8);
+  h.write('fmt ', 12);
+  h.writeUInt32LE(16, 16);          // fmt chunk size
+  h.writeUInt16LE(1, 20);           // PCM
+  h.writeUInt16LE(channels, 22);
+  h.writeUInt32LE(sampleRate, 24);
+  h.writeUInt32LE(byteRate, 28);
+  h.writeUInt16LE(blockAlign, 32);
+  h.writeUInt16LE(bits, 34);
+  h.write('data', 36);
+  h.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([h, pcm]);
 }
 
 function sendLatency(ws: WebSocket, label: string, ms: number) {
@@ -191,6 +216,13 @@ wss.on('connection', (ws) => {
     tts?: boolean;
     device_id?: string;
   } = {};
+
+  // Streamed audio upload: the device streams raw PCM (16 kHz mono s16le) frames
+  // while the child is still talking, bracketed by audio_start/audio_end control
+  // frames, so the upload overlaps speech instead of blocking after it. Buffer
+  // the chunks and assemble a WAV on audio_end, then run the normal STT turn.
+  let audioStreaming = false;
+  let audioChunks: Buffer[] = [];
 
   interface TurnParams {
     text: string;
@@ -433,6 +465,9 @@ wss.on('connection', (ws) => {
 
   ws.on('message', async (raw, isBinary) => {
     if (isBinary) {
+      // While streaming, binary frames are raw-PCM chunks; otherwise it's a
+      // single complete WAV (legacy path used by the web client / probes).
+      if (audioStreaming) { audioChunks.push(raw as Buffer); return; }
       await handleAudio(raw as Buffer);
       return;
     }
@@ -451,6 +486,24 @@ wss.on('connection', (ws) => {
       sessionTurns = 0;
       currentConversationId = null;
       safeSend(ws, { type: 'done' });
+      return;
+    }
+    if (msg?.type === 'audio_start') {
+      audioStreaming = true;
+      audioChunks = [];
+      return;
+    }
+    if (msg?.type === 'audio_cancel') {
+      audioStreaming = false;
+      audioChunks = [];
+      return;
+    }
+    if (msg?.type === 'audio_end') {
+      audioStreaming = false;
+      const pcm = Buffer.concat(audioChunks);
+      audioChunks = [];
+      if (pcm.length) await handleAudio(pcmToWav(pcm));
+      else safeSend(ws, { type: 'done' });
       return;
     }
     if (msg?.type === 'battery') {

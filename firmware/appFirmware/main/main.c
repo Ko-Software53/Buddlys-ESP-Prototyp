@@ -38,6 +38,22 @@ static int16_t *s_rec_buf  = NULL;
 static size_t   s_rec_samples = 0;
 static size_t   s_rec_cap     = 0;
 
+// ─── Streamed audio upload ──────────────────────────────────────────────────
+// Instead of one blocking send of the whole WAV after end-of-speech (which put
+// the entire 1.5–3 s upload on the critical path AFTER the child stopped
+// talking), we stream the recording to the server WHILE the child is still
+// speaking. s_rec_buf is a single-producer/single-consumer buffer: the capture
+// loop appends and advances s_rec_samples; audio_sender_task drains
+// [s_tx_sent, s_rec_samples) as raw-PCM binary frames. Both run on CPU0, so the
+// "write sample, then bump the index" ordering the consumer relies on holds.
+// Control frames bracket the stream: audio_start (before any chunk), audio_end
+// (after the last), or audio_cancel (utterance discarded — too short/silent).
+#define STREAM_CHUNK_SAMPLES  3200   // 200 ms @ 16 kHz: flush granularity
+static volatile size_t s_tx_sent      = 0;
+static volatile bool   s_streaming    = false;  // an utterance is being streamed
+static volatile bool   s_stream_end   = false;  // capture done; flush tail + finish
+static volatile bool   s_stream_cancel = false; // discard utterance (too short/silent)
+
 #define WS_REASSEMBLY_SIZE (64 * 1024)
 static char    *s_ws_buf     = NULL;
 static size_t   s_ws_buf_len = 0;
@@ -323,56 +339,72 @@ static void playback_task(void *arg)
 
 // ─── WAV header ──────────────────────────────────────────────────────────
 
-static void make_wav_header(uint8_t *h, uint32_t pcm_bytes)
-{
-    uint32_t file_size  = 36 + pcm_bytes;
-    uint32_t byte_rate  = MIC_SAMPLE_RATE * 1 * MIC_BITS / 8;
-    uint16_t block_align = 1 * MIC_BITS / 8;
-    uint16_t pcm_fmt = 1, channels = 1, bits = MIC_BITS;
-    uint32_t sr = MIC_SAMPLE_RATE, chunk16 = 16;
+// Stream the recorded utterance to the server as raw PCM (16 kHz mono s16le) in
+// binary frames WHILE the child is still talking, bracketed by audio_start /
+// audio_end text control frames. The server reassembles the chunks into a WAV
+// and runs STT on the same persistent connection (no per-turn TLS handshake).
+// Streaming overlaps the upload with speech, so end-of-speech → STT no longer
+// waits on a multi-second blocking transfer.
 
-    memcpy(h,      "RIFF", 4); memcpy(h+4,  &file_size,   4);
-    memcpy(h+8,   "WAVE", 4); memcpy(h+12, "fmt ", 4);
-    memcpy(h+16,  &chunk16,   4); memcpy(h+20, &pcm_fmt,    2);
-    memcpy(h+22,  &channels,  2); memcpy(h+24, &sr,         4);
-    memcpy(h+28,  &byte_rate, 4); memcpy(h+32, &block_align,2);
-    memcpy(h+34,  &bits,      2); memcpy(h+36, "data",      4);
-    memcpy(h+40,  &pcm_bytes, 4);
-}
-
-// ─── STT over WebSocket ─────────────────────────────────────────────────────
-// Send the recorded utterance as a WAV inside a binary WS frame. The server
-// transcribes it and runs the turn on the same persistent connection, so there
-// is no per-turn TLS handshake. The old approach opened a fresh HTTPS /stt
-// connection every turn — once the server moved to a remote host, that
-// per-turn TLS handshake (slow on the ESP32) became the dominant latency.
-
-static void send_audio_ws(const int16_t *pcm, size_t samples)
+static void send_audio_ctrl(const char *type)
 {
     if (!s_ws_connected || !s_ws) return;
+    char msg[48];
+    int n = snprintf(msg, sizeof(msg), "{\"type\":\"%s\"}", type);
+    esp_websocket_client_send_text(s_ws, msg, n, pdMS_TO_TICKS(3000));
+}
 
-    size_t pcm_bytes = samples * sizeof(int16_t);
-    size_t body_len  = 44 + pcm_bytes;
+// Open a streamed utterance: announce it, then arm the sender. audio_start MUST
+// reach the server before any chunk, so we send it (synchronously) before
+// flipping s_streaming on. Caller must have already reset s_rec_samples = 0.
+static void stream_begin(void)
+{
+    s_tx_sent    = 0;
+    s_stream_end = false;
+    send_audio_ctrl("audio_start");
+    s_streaming  = true;
+}
 
-    uint8_t *body = heap_caps_malloc(body_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!body) body = malloc(body_len);
-    if (!body) {
-        ESP_LOGE(TAG, "OOM for WAV body (%u bytes)", (unsigned)body_len);
-        return;
+// Drains s_rec_buf to the server as the capture loop fills it. Pinned to CPU0
+// (same core as capture) so the producer's "write sample, then bump index"
+// ordering is observed here without explicit barriers. A blocking send only
+// parks THIS task on socket I/O; the capture loop keeps reading the mic.
+static void audio_sender_task(void *arg)
+{
+    for (;;) {
+        if (!s_streaming) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+
+        if (s_stream_cancel) {            // utterance discarded — drop buffered audio
+            send_audio_ctrl("audio_cancel");
+            s_streaming = false; s_stream_end = false; s_stream_cancel = false;
+            continue;
+        }
+
+        size_t produced  = s_rec_samples;     // snapshot producer index
+        size_t avail     = produced - s_tx_sent;
+        bool   finishing = s_stream_end;
+
+        if (avail >= STREAM_CHUNK_SAMPLES || (finishing && avail > 0)) {
+            size_t n = avail > STREAM_CHUNK_SAMPLES ? STREAM_CHUNK_SAMPLES : avail;
+            int sent = esp_websocket_client_send_bin(
+                s_ws, (const char *)(s_rec_buf + s_tx_sent),
+                (int)(n * sizeof(int16_t)), pdMS_TO_TICKS(10000));
+            if (sent < 0) {
+                ESP_LOGE(TAG, "stream send failed — aborting utterance");
+                s_streaming = false; s_stream_end = false;
+                send_audio_ctrl("audio_cancel");
+                continue;
+            }
+            s_tx_sent += n;
+        } else if (finishing) {            // all drained → close the utterance
+            send_audio_ctrl("audio_end");
+            ESP_LOGI(TAG, "→ WS streamed %u samples", (unsigned)s_tx_sent);
+            s_streaming  = false;
+            s_stream_end = false;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));  // wait for the capture loop
+        }
     }
-    make_wav_header(body, pcm_bytes);
-    memcpy(body + 44, pcm, pcm_bytes);
-
-    int sent = esp_websocket_client_send_bin(s_ws, (const char *)body,
-                                             (int)body_len, pdMS_TO_TICKS(10000));
-    free(body);
-
-    if (sent < 0) {
-        ESP_LOGE(TAG, "WS audio send failed");
-        return;
-    }
-    s_thinking_since_ms = now_ms();
-    ESP_LOGI(TAG, "→ WS audio: %u bytes", (unsigned)body_len);
 }
 
 // ─── WebSocket ───────────────────────────────────────────────────────────
@@ -482,6 +514,8 @@ static void ws_event_handler(void *arg, esp_event_base_t base,
             s_stream_active = false;
             s_ws_buf_len    = 0;
             s_config_sent   = false;   // re-send config after reconnect
+            // Drop any in-progress upload; nothing can be sent until reconnect.
+            s_streaming = false; s_stream_end = false; s_stream_cancel = false;
             break;
         case WEBSOCKET_EVENT_DATA:
             if (ev->op_code == 0x8) break;
@@ -647,6 +681,7 @@ static void start_recording(void)
     if (s_recording) return;
     s_rec_samples = 0;
     s_recording   = true;
+    stream_begin();
     ESP_LOGI(TAG, "Recording...");
 }
 
@@ -666,6 +701,7 @@ static void capture_chunk(void)
     if (s_rec_samples >= s_rec_cap) {
         ESP_LOGW(TAG, "Recording buffer full");
         s_recording = false;
+        if (s_streaming) { s_thinking_since_ms = now_ms(); s_stream_end = true; }
     }
 }
 
@@ -682,11 +718,18 @@ static void stop_and_send(void)
     float dur = (float)s_rec_samples / MIC_SAMPLE_RATE;
     ESP_LOGI(TAG, "Recorded %.1fs, peak=%d", dur, peak);
 
-    if (peak < 50) { ESP_LOGW(TAG, "Mic silent"); return; }
-    if (s_rec_samples < (size_t)(MIC_SAMPLE_RATE / 2)) { ESP_LOGW(TAG, "Too short"); return; }
+    // Capture is done; the sender keeps reading s_rec_buf[s_tx_sent..s_rec_samples]
+    // (frozen now that s_recording is false) until drained. Don't reset
+    // s_rec_samples here — the next start_recording/onset does that, after the
+    // half-duplex playback gate guarantees this stream has long since finished.
+    if (peak < 50 || s_rec_samples < (size_t)(MIC_SAMPLE_RATE / 2)) {
+        ESP_LOGW(TAG, "%s", peak < 50 ? "Mic silent — cancel" : "Too short — cancel");
+        s_stream_cancel = true;   // sender drops buffered chunks
+        return;
+    }
 
-    send_audio_ws(s_rec_buf, s_rec_samples);
-    s_rec_samples = 0;
+    s_thinking_since_ms = now_ms();
+    s_stream_end = true;          // sender flushes the tail + sends audio_end
 }
 
 // ─── VAD capture ──────────────────────────────────────────────────────────
@@ -730,7 +773,9 @@ static void vad_capture_chunk(void)
         }
 
         bool playing_back = s_stream_active || (now_ms() - s_last_speaking_ms) < VAD_SUPPRESS_MS;
-        if (energy >= VAD_SPEECH_THRESHOLD) {
+        // Don't open a new utterance until the previous one has finished
+        // uploading (audio_start..audio_end), so the two streams can't interleave.
+        if (energy >= VAD_SPEECH_THRESHOLD && !s_streaming) {
             if (playing_back) {
                 s_drain_jbuf       = true;
                 s_last_speaking_ms = 0;
@@ -742,6 +787,7 @@ static void vad_capture_chunk(void)
             s_vad_in_speech    = true;
             s_silence_since_ms = 0;
             s_recording        = true;
+            stream_begin();   // audio_start + arm the sender (s_rec_samples is 0 here)
 
             size_t preroll_count = s_preroll_full ? VAD_PREROLL_FRAMES : s_preroll_head;
             size_t from = s_preroll_full ? s_preroll_head : 0;
@@ -839,6 +885,9 @@ void app_main(void)
     buttons_init();
     xTaskCreate(led_task, "led", 2048, NULL, 3, NULL);
     xTaskCreatePinnedToCore(playback_task, "playback", 4096, NULL, 18, NULL, 1);
+    // Pinned to CPU0 (same core as the capture loop) so the producer/consumer
+    // index ordering on s_rec_buf holds without explicit memory barriers.
+    xTaskCreatePinnedToCore(audio_sender_task, "audio_tx", 4096, NULL, 6, NULL, 0);
 
     wifi_driver_init();
 
@@ -917,6 +966,7 @@ void app_main(void)
                             (now_ms() - s_last_speaking_ms) < VAD_SUPPRESS_MS;
         if (playing_back) {
             if (s_recording)   { s_recording = false; s_rec_samples = 0; }
+            if (s_streaming)   s_stream_cancel = true;  // abort any in-progress upload
             s_vad_in_speech    = false;
             s_silence_since_ms = 0;
             last_pressed       = false;

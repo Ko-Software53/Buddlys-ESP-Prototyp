@@ -59,12 +59,19 @@ LLM (Mistral) replies → server streams TTS audio back → toy plays it. Half-d
 
 ## The end-to-end turn (so you don't have to trace it)
 
-1. Toy captures speech (VAD or push-to-talk), packs PCM into a WAV, sends it as a
-   **binary** WS frame (`send_audio_ws`, main.c).
+1. Toy captures speech (VAD or push-to-talk) and **streams it WHILE talking**: a text
+   `audio_start` frame, then raw-PCM (16 kHz mono s16le) **binary** chunks sent by a
+   dedicated `audio_sender_task` (CPU0) draining `s_rec_buf`, then `audio_end` (or
+   `audio_cancel` if too short/silent). This overlaps the upload with speech so
+   end-of-speech→STT no longer waits on a multi-second blocking transfer. (The old
+   `send_audio_ws`/`make_wav_header` single-WAV-frame path was removed 2026-05-31.)
 2. On connect the toy first sends a **text** `config` frame with device_id, model,
    reasoning, and **ttsProvider** (`send_config`, main.c).
-3. Server: `ws.on('message')` — binary → `handleAudio` (STT then `handleTurn`);
-   text → stores `config` into `turnCfg`, or handles `battery`/`reset`/`user_text`.
+3. Server: `ws.on('message')` — text `audio_start` begins buffering; subsequent
+   **binary** frames are appended as raw PCM; `audio_end` assembles them via
+   `pcmToWav` and calls `handleAudio` (STT then `handleTurn`). A binary frame
+   received OUTSIDE a stream is still treated as one complete WAV (legacy web-client
+   path). Other text frames: `config`→`turnCfg`, `battery`/`reset`/`user_text`.
 4. `handleTurn` streams LLM deltas (`text_delta`), chunks them, feeds TTS, and streams
    audio back as `audio_chunk` JSON frames carrying base64 PCM (16 kHz mono s16le).
 5. Toy decodes base64 → `s_jbuf` jitter buffer → `playback_task` plays at realtime.
