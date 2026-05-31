@@ -50,8 +50,8 @@
 #define TALK_MODE_DEFAULT       1
 
 // VAD settings — thresholds are in post-software-gain RMS units
-#define VAD_SPEECH_THRESHOLD    1200  // RMS to trigger speech onset
-#define VAD_CONTINUE_THRESHOLD  600   // RMS to keep an active turn alive; below this counts toward end-of-turn silence
+#define VAD_SPEECH_THRESHOLD    1000  // RMS to trigger speech onset
+#define VAD_CONTINUE_THRESHOLD  300   // RMS to keep an active turn alive; below this counts toward end-of-turn silence
 #define VAD_SILENCE_MS          300   // ms below the continue threshold before the turn ends
 #define VAD_PREROLL_MS          200   // ms of audio captured before onset
 #define VAD_SUPPRESS_MS         700   // echo-tail guard after last playback sample before the mic re-engages (half-duplex)
