@@ -2,6 +2,11 @@ CONFIG_IDF_TARGET="esp32s3"
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 CONFIG_FREERTOS_HZ=1000
 
+# Run the CPU at full 240 MHz (default was 160): more headroom for the receive
+# path — TLS decrypt + cJSON parse + base64 decode of streamed audio_chunk frames
+# — which at 160 MHz couldn't keep up with realtime playback (jbuf underruns).
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
 # Enable 8MB octal PSRAM (on-chip, AP_3v3)
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
@@ -12,6 +17,15 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # WebSocket client
 CONFIG_ESP_WEBSOCKET_CLIENT=y
 CONFIG_WS_BUFFER_SIZE=65536
+
+# ── TCP windows ──────────────────────────────────────────────────────────────
+# The ESP-IDF default send/recv window is 5760 B. Over a high-RTT path to the
+# cloud server (Railway, esp. via a phone hotspot) TCP throughput is capped at
+# window/RTT — ~150–300 kbit/s, BELOW the 256 kbit/s of raw 16 kHz audio — so
+# the streamed upload can never keep up and latency balloons. 64800 B (45×MSS,
+# under the 65535 no-window-scaling limit) lifts that ceiling to multi-Mbit/s.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=64800
+CONFIG_LWIP_TCP_WND_DEFAULT=64800
 
 # TLS / HTTPS not needed (plain HTTP to local server)
 CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y

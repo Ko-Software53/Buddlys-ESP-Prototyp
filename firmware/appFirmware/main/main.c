@@ -68,7 +68,10 @@ static volatile bool     s_stream_active     = false;
 static int      s_talk_mode        = TALK_MODE_DEFAULT;
 
 #define JITTER_BUF_SAMPLES  (MIC_SAMPLE_RATE * 8)
-#define JITTER_PREBUF_MS    400   // prebuffer before playback starts; absorbs WAN/TLS jitter (was 50 — too small over the internet)
+#define JITTER_PREBUF_MS    1500  // prebuffer before playback starts. Long replies stream at only ~1.0x realtime
+                                  // (LLM-token-gated) with ~1s gaps, so a small cushion underruns immediately.
+                                  // 1.5s absorbs that jitter. Short replies arrive at ~6x and flush on stream-end
+                                  // before this fills, so they keep their low latency. Real fix is short replies.
 static int16_t       *s_jbuf    = NULL;
 static volatile size_t s_jbuf_wr = 0;
 static volatile size_t s_jbuf_rd = 0;
@@ -165,7 +168,12 @@ static void on_wifi_disconnect(void *arg, esp_event_base_t base, int32_t id, voi
 {
     ESP_LOGW(TAG, "WiFi disconnected");
     s_ws_connected = false;
-    if (s_wifi_established) {
+    // Retry on disconnect during the INITIAL connect too, not only after a
+    // connection was once established. Some APs (e.g. WPA3 WLAN-65QWSM) answer
+    // the first association with "refused temporarily"; without this retry the
+    // single attempt failed and we sat idle until the 15 s timeout, never
+    // getting an IP (then DNS/getaddrinfo fails and the WS can't connect).
+    if (s_wifi_established || s_wifi_connecting) {
         ESP_LOGI(TAG, "Re-connecting...");
         esp_wifi_connect();
     }
@@ -290,7 +298,6 @@ static void playback_task(void *arg)
 {
     const size_t CHUNK  = MIC_SAMPLE_RATE * 30 / 1000;
     const size_t PREBUF = (size_t)(MIC_SAMPLE_RATE * JITTER_PREBUF_MS / 1000);
-    bool primed  = false;
     bool playing = false;
     esp_codec_dev_handle_t play = get_playback_handle();
     int16_t stereo[MIC_SAMPLE_RATE * 30 / 1000 * 2];
@@ -309,13 +316,29 @@ static void playback_task(void *arg)
         size_t rd    = s_jbuf_rd;
         size_t avail = (wr >= rd) ? (wr - rd) : (JITTER_BUF_SAMPLES - rd + wr);
 
-        if (!playing && avail >= (primed ? 1u : PREBUF)) {
+        // Re-buffer a full PREBUF cushion at the start of EVERY turn (not just the
+        // first) to absorb network/TTS jitter. The old code latched a `primed`
+        // flag true forever, so only the first reply got a cushion and every later
+        // reply started on a single sample → instant underrun → stutter. Exception:
+        // if the stream already ended, flush a reply shorter than PREBUF right away
+        // instead of waiting for a cushion that will never arrive.
+        if (!playing && avail > 0 && (avail >= PREBUF || !s_stream_active)) {
             playing = true;
-            primed  = true;
         }
 
+        // Turn finished and buffer fully drained → stop, re-arming the cushion.
         if (playing && avail == 0 && !s_stream_active) {
             playing = false;
+        }
+
+        // Mid-stream underrun (more audio expected but buffer empty) = the stutter.
+        // Log it (throttled) so a persistent problem is visible in the monitor.
+        if (playing && avail == 0 && s_stream_active) {
+            static uint32_t s_last_underrun_ms = 0;
+            if (now_ms() - s_last_underrun_ms >= 500) {
+                s_last_underrun_ms = now_ms();
+                ESP_LOGW(TAG, "playback underrun (jbuf empty mid-stream)");
+            }
         }
 
         if (playing) {
@@ -379,6 +402,14 @@ static void audio_sender_task(void *arg)
             s_streaming = false; s_stream_end = false; s_stream_cancel = false;
             continue;
         }
+
+        // Do NOT transmit while the mic is still live: continuous WiFi TX couples
+        // noise into the high-gain ES7210 ADC, lifting the RMS above
+        // VAD_CONTINUE_THRESHOLD so end-of-speech never fires (the turn ran to the
+        // 15 s cap). The TCP-window fix makes the post-speech upload fast enough
+        // (~200 ms for a normal turn) that we don't need to overlap it with speech,
+        // so we hold all chunks until capture finishes (s_stream_end), then burst.
+        if (!s_stream_end) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
 
         size_t produced  = s_rec_samples;     // snapshot producer index
         size_t avail     = produced - s_tx_sent;
@@ -816,6 +847,15 @@ static void vad_capture_chunk(void)
         // Anything below VAD_CONTINUE_THRESHOLD (room noise, trailing breath)
         // counts toward silence, so the mic releases ~VAD_SILENCE_MS after the
         // child actually stops talking instead of being held open by ambient noise.
+        // Diagnostic: surface the live RMS once a second while in speech, so a
+        // turn that won't end reveals whether the noise floor sits above
+        // VAD_CONTINUE_THRESHOLD (e.g. WiFi-TX coupling) vs. real continuous sound.
+        static uint32_t s_last_rms_log_ms = 0;
+        if (now_ms() - s_last_rms_log_ms >= 1000) {
+            s_last_rms_log_ms = now_ms();
+            ESP_LOGI(TAG, "VAD: in-speech rms=%d (continue>=%d)", energy, VAD_CONTINUE_THRESHOLD);
+        }
+
         if (energy >= VAD_CONTINUE_THRESHOLD) {
             s_silence_since_ms = 0;
         } else if (s_silence_since_ms == 0) {
