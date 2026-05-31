@@ -57,9 +57,9 @@
                                       // ended → ran to the 15s buffer cap and uploaded huge recordings. Real continued speech
                                       // sits well above 500 (onset gate is 800); 500 lets the ~350 noise floor count as silence
                                       // so end-of-speech actually fires. If a noisy room still won't end turns, raise toward 600.
-#define VAD_SILENCE_MS          600   // ms below the continue threshold before the turn ends (higher = tolerates mid-sentence pauses like "uhm").
+#define VAD_SILENCE_MS          900   // ms below the continue threshold before the turn ends (higher = tolerates mid-sentence pauses like "uhm").
                                       // This is pure dead time after the child stops talking, ON the critical path before STT even starts —
-                                      // every ms here is felt as latency. 600 still tolerates short pauses; drop toward 450 if kids feel cut off rarely.
+                                      // every ms here is felt as latency. 900 tolerates thinking pauses and filler words ("um"); drop toward 600 if latency bothers.
 #define VAD_PREROLL_MS          200   // ms of audio captured before onset
 #define VAD_SUPPRESS_MS         700   // echo-tail guard after last playback sample before the mic re-engages (half-duplex)
 

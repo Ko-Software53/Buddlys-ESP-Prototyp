@@ -9,57 +9,12 @@ import 'dotenv/config';
  * so the LLM can judge relevance and trustworthiness.
  *
  * Uses `search_depth: 'advanced'` for more accurate extraction.
- * Includes conflict detection when sources disagree.
  *
  * Fallback ohne Key: knapper Hinweis-String. So weiß der LLM, dass die
  * Suche nicht ging, statt halluziniert "Ergebnis"-Text zu erfinden.
  */
 
 const TAVILY_URL = 'https://api.tavily.com/search';
-
-/**
- * Simple heuristic to detect contradictions among snippets.
- * Looks for explicit negation patterns across sources.
- */
-function detectConflicts(snippets: string[]): boolean {
-  if (snippets.length < 2) return false;
-  // Normalize for comparison
-  const normalized = snippets.map((s) => s.toLowerCase());
-  // Check for explicit negation patterns that suggest disagreement
-  const negationPairs = [
-    [/\bja\b/, /\bnein\b/],
-    [/\brichtig\b/, /\bfalsch\b/],
-    [/\bwahr\b/, /\bunwahr\b/],
-    [/\bstimmt\b/, /\bstimmt nicht\b/],
-    [/\bis correct\b/, /\bis incorrect\b/],
-    [/\btrue\b/, /\bfalse\b/],
-    [/\byes\b/, /\bno\b/],
-  ];
-  for (const [pos, neg] of negationPairs) {
-    const hasPos = normalized.some((s) => pos.test(s));
-    const hasNeg = normalized.some((s) => neg.test(s));
-    if (hasPos && hasNeg) return true;
-  }
-  // Check for contradictory numbers in similar context (e.g. different heights, populations)
-  // Extract all numbers from each snippet
-  const numberSets = normalized.map((s) => {
-    const matches = s.match(/\d[\d.,]*/g);
-    return matches ? matches.map((m) => parseFloat(m.replace(/\./g, '').replace(',', '.'))) : [];
-  });
-  // If two snippets contain very different large numbers (>100), flag as potential conflict
-  for (let i = 0; i < numberSets.length; i++) {
-    for (let j = i + 1; j < numberSets.length; j++) {
-      for (const a of numberSets[i]) {
-        for (const b of numberSets[j]) {
-          if (a > 100 && b > 100 && Math.abs(a - b) / Math.max(a, b) > 0.3) {
-            return true;
-          }
-        }
-      }
-    }
-  }
-  return false;
-}
 
 /**
  * Enriches the query with today's date for time-sensitive searches.
@@ -154,15 +109,6 @@ export async function webSearch(query: string): Promise<string> {
       output += `Zusammenfassung: ${data.answer}\n\n`;
     }
     output += `Quellen:\n${formattedResults}`;
-
-    // Detect conflicts
-    const snippets = results
-      .map((r) => r.content || '')
-      .filter(Boolean);
-    if (detectConflicts(snippets)) {
-      output += '\n\n⚠️ ACHTUNG: Die Quellen widersprechen sich teilweise. ' +
-        'Sei vorsichtig und sag dem Kind, dass du dir nicht ganz sicher bist.';
-    }
 
     return output;
   } catch (err) {

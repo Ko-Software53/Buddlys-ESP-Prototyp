@@ -1,11 +1,13 @@
-import { useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { useEffect, useMemo, useState } from 'react';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { supabase } from '../supabase';
 import type { CommentRow, ConversationRow, MessageRow } from '../lib/types';
 import { fmtDateTime, fmtDuration } from '../lib/format';
+import { eur, usageFromMessages, variableCost } from '../lib/cost';
 
 export default function ConversationDetail({ userId }: { userId: string }) {
   const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
   const [conv, setConv] = useState<ConversationRow | null>(null);
   const [messages, setMessages] = useState<MessageRow[]>([]);
   const [comments, setComments] = useState<CommentRow[]>([]);
@@ -13,6 +15,9 @@ export default function ConversationDetail({ userId }: { userId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
   const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
+  const cost = useMemo(() => variableCost(usageFromMessages(messages)), [messages]);
 
   const load = async () => {
     if (!id) return;
@@ -58,6 +63,17 @@ export default function ConversationDetail({ userId }: { userId: string }) {
     setComments((cs) => cs.filter((c) => c.id !== commentId));
   };
 
+  const deleteConversation = async () => {
+    if (!conv) return;
+    if (!window.confirm('Diesen Dialog endgültig löschen? Transkript und Kommentare werden mitgelöscht.')) return;
+    setDeleting(true);
+    // Delete the base-table row (cascades to messages + comments). The dashboard
+    // reads anonymized views but writes by id to `conversations`, same as flagging.
+    const { error } = await supabase.from('conversations').delete().eq('id', conv.id);
+    if (error) { setError(error.message); setDeleting(false); return; }
+    navigate('/conversations', { replace: true });
+  };
+
   if (loading) return <p className="muted">Lädt Dialog …</p>;
   if (error) return <div className="card error"><p>Fehler: {error}</p></div>;
   if (!conv) return <p className="muted">Dialog nicht gefunden.</p>;
@@ -72,14 +88,22 @@ export default function ConversationDetail({ userId }: { userId: string }) {
           <div className="meta">
             <span>Dauer: {fmtDuration(conv.duration_seconds)}</span>
             <span>{conv.message_count} Nachrichten</span>
+            <span title={`STT ${eur(cost.stt)} · LLM ${eur(cost.llm)} · TTS ${eur(cost.tts)} — geschätzt aus dem Transkript`}>
+              Kosten: ~{eur(cost.total)}
+            </span>
             {conv.use_case && <span>Use-Case: {conv.use_case}</span>}
             {(conv.topics ?? []).map((t) => <span key={t} className="tag">{t}</span>)}
           </div>
           {conv.summary && <p className="summary-block">{conv.summary}</p>}
         </div>
-        <button className={`btn ${conv.flagged ? 'danger' : 'ghost'}`} onClick={toggleFlag}>
-          {conv.flagged ? '⚑ Flag entfernen' : '⚑ Als problematisch flaggen'}
-        </button>
+        <div className="detail-actions">
+          <button className={`btn ${conv.flagged ? 'danger' : 'ghost'}`} onClick={toggleFlag}>
+            {conv.flagged ? '⚑ Flag entfernen' : '⚑ Als problematisch flaggen'}
+          </button>
+          <button className="btn danger" onClick={deleteConversation} disabled={deleting}>
+            {deleting ? 'Löscht …' : '🗑 Dialog löschen'}
+          </button>
+        </div>
       </div>
 
       {conv.flagged && conv.flag_reason && (

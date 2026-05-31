@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { supabase } from '../supabase';
 import type { ConversationRow } from '../lib/types';
 import { fmtDateTime, fmtDuration } from '../lib/format';
+import { conversationCost, eur, usageFromRow } from '../lib/cost';
 
 type FlagFilter = 'all' | 'flagged' | 'ok';
 
@@ -13,6 +14,18 @@ export default function Conversations() {
   const [flagFilter, setFlagFilter] = useState<FlagFilter>('all');
   const [topic, setTopic] = useState('');
   const [search, setSearch] = useState('');
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  const deleteRow = async (r: ConversationRow) => {
+    if (!window.confirm(`Dialog vom ${fmtDateTime(r.created_at)} (${r.device_code}) endgültig löschen?`)) return;
+    setDeletingId(r.id);
+    // Write to the base `conversations` table by id (cascades to messages +
+    // comments); the list reads the anonymized view but shares the same id.
+    const { error } = await supabase.from('conversations').delete().eq('id', r.id);
+    if (error) setError(error.message);
+    else setRows((rs) => rs.filter((x) => x.id !== r.id));
+    setDeletingId(null);
+  };
 
   useEffect(() => {
     supabase
@@ -77,6 +90,7 @@ export default function Conversations() {
               <th>Buddly</th>
               <th>Dauer</th>
               <th>Nachr.</th>
+              <th title="Geschätzte variable Kosten (STT + LLM + TTS), grob aus Nachrichtenanzahl & Dauer">Kosten</th>
               <th>Use-Case</th>
               <th>Themen</th>
               <th>Zusammenfassung</th>
@@ -90,6 +104,7 @@ export default function Conversations() {
                 <td className="mono">{r.device_code}</td>
                 <td className="nowrap">{fmtDuration(r.duration_seconds)}</td>
                 <td>{r.message_count}</td>
+                <td className="nowrap mono">~{eur(conversationCost(usageFromRow(r)))}</td>
                 <td>{r.use_case || '–'}</td>
                 <td>
                   {(r.topics ?? []).map((t) => <span key={t} className="tag">{t}</span>)}
@@ -98,11 +113,16 @@ export default function Conversations() {
                   {r.flagged && <span className="flag" title={r.flag_reason ?? 'geflaggt'}>⚑</span>}
                   {r.summary || <span className="muted">–</span>}
                 </td>
-                <td><Link className="btn ghost sm" to={`/conversations/${r.id}`}>Öffnen</Link></td>
+                <td className="row-actions nowrap">
+                  <Link className="btn ghost sm" to={`/conversations/${r.id}`}>Öffnen</Link>
+                  <button className="btn danger sm" disabled={deletingId === r.id} onClick={() => deleteRow(r)}>
+                    {deletingId === r.id ? '…' : '🗑'}
+                  </button>
+                </td>
               </tr>
             ))}
             {!filtered.length && (
-              <tr><td colSpan={8} className="muted center">Keine Dialoge für diesen Filter.</td></tr>
+              <tr><td colSpan={9} className="muted center">Keine Dialoge für diesen Filter.</td></tr>
             )}
           </tbody>
         </table>

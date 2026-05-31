@@ -6,6 +6,9 @@ import {
 import { supabase } from '../supabase';
 import type { ConversationRow } from '../lib/types';
 import { fmtDate, fmtDuration, topCounts, weekdayLabel } from '../lib/format';
+import {
+  addUsage, conversationCost, emptyUsage, eur, monthlyScenarios, usageFromRow,
+} from '../lib/cost';
 
 // Minimal: one Buddly-blue accent, one muted tone. No multi-color charts.
 const ACCENT = '#086BDE';
@@ -73,9 +76,25 @@ export default function Overview() {
     const topics = topCounts(rows.flatMap((r) => r.topics ?? []), 10);
     const useCases = topCounts(rows.map((r) => r.use_case ?? '').filter(Boolean), 8);
 
+    // ── Cost ──────────────────────────────────────────────────────────────────
+    // Aggregate estimated usage across all conversations, then project the
+    // monthly bill for each architecture choice. We scale by the observed time
+    // window so the projection reflects a typical 30 days, not the whole history.
+    const totalUsage = rows.reduce((acc, r) => addUsage(acc, usageFromRow(r)), emptyUsage);
+    const totalCost = rows.reduce((sum, r) => sum + conversationCost(usageFromRow(r)), 0);
+    let windowDays = 30;
+    if (rows.length > 1) {
+      const ts = rows.map((r) => new Date(r.created_at).getTime());
+      windowDays = Math.max(1, (Math.max(...ts) - Math.min(...ts)) / 86_400_000);
+    }
+    const scenarios = monthlyScenarios(totalUsage, windowDays);
+    const cheapest = scenarios.reduce((a, b) => (b.monthlyEur < a.monthlyEur ? b : a));
+    const costPerConv = total ? totalCost / total : 0;
+
     return {
       total, avg, totalMinutes: Math.round(totalSeconds / 60), devices, flagged,
       byHour, byWeekday, daily, topics, useCases,
+      totalCost, scenarios, cheapest, costPerConv, windowDays,
     };
   }, [rows]);
 
@@ -93,7 +112,55 @@ export default function Overview() {
         <Kpi label="Gesamt-Sprechzeit" value={`${stats.totalMinutes} min`} />
         <Kpi label="Aktive Buddlys" value={String(stats.devices)} />
         <Kpi label="Geflaggt" value={String(stats.flagged)} tone={stats.flagged ? 'warn' : undefined} />
+        <Kpi label="Geschätzte Kosten (gesamt)" value={`~${eur(stats.totalCost)}`} />
+        <Kpi label="Ø Kosten / Gespräch" value={`~${eur(stats.costPerConv)}`} />
       </div>
+
+      <Panel title="Kostenprojektion / Monat — Architektur-Vergleich">
+        <p className="muted projection-hint">
+          Hochgerechnet auf 30 Tage aus der beobachteten Nutzung (~{Math.round(stats.windowDays)} Tage,
+          {' '}{stats.total} Gespräche). „Variabel“ = Pay-as-you-go (STT/LLM/TTS), „Fix“ = gemietete GPU
+          rund um die Uhr. Alle Sätze sind editierbare Schätzwerte in <code>src/lib/cost.ts</code>.
+        </p>
+        <div className="table-wrap">
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Szenario</th>
+                <th>Variabel / Mon.</th>
+                <th>Fix / Mon.</th>
+                <th>Gesamt / Mon.</th>
+                <th>Ø / Gespräch</th>
+                <th>Details</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stats.scenarios.map((s) => {
+                const perConv = stats.total
+                  ? s.monthlyEur / (stats.total * (30 / Math.max(1, stats.windowDays)))
+                  : 0;
+                return (
+                  <tr key={s.key} className={s.key === stats.cheapest.key ? 'flagged-row' : ''}>
+                    <td>
+                      {s.key === stats.cheapest.key && <span className="tag">günstigste</span>} {s.name}
+                    </td>
+                    <td className="nowrap mono">{eur(s.variableEur)}</td>
+                    <td className="nowrap mono">{s.fixedEur ? eur(s.fixedEur) : '–'}</td>
+                    <td className="nowrap mono"><strong>{eur(s.monthlyEur)}</strong></td>
+                    <td className="nowrap mono">~{eur(perConv)}</td>
+                    <td className="summary">{s.note}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <p className="muted projection-hint">
+          Fixe GPU-Kosten lohnen sich erst ab genügend Volumen: bei wenig Nutzung ist „Managed“ günstiger,
+          bei viel Nutzung amortisiert eine gemietete GPU den Stückpreis. Self-host-LLM rechnet mit einer
+          A100 80&nbsp;GB (Mistral Small ~24B braucht ~48&nbsp;GB VRAM inkl. KV-Cache).
+        </p>
+      </Panel>
 
       <div className="grid2">
         <Panel title="Nutzung nach Tageszeit">
