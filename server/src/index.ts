@@ -91,7 +91,7 @@ interface TtsSession {
 }
 type ClientMsg =
   | { type: 'user_text'; text: string; reasoning?: ReasoningMode; model?: string; tts?: boolean; temperature?: number; ttsProvider?: TtsProvider; device_id?: string }
-  | { type: 'config'; device_id?: string; model?: string; reasoning?: ReasoningMode; tts?: boolean; ttsProvider?: TtsProvider }
+  | { type: 'config'; device_id?: string; model?: string; reasoning?: ReasoningMode; tts?: boolean; ttsProvider?: TtsProvider; audioBinary?: boolean }
   | { type: 'battery'; device_id: string; level: number }
   | { type: 'audio_start' }
   | { type: 'audio_end' }
@@ -161,6 +161,21 @@ wss.on('connection', (ws) => {
   // the connection; the toy picks up app changes on its next (re)connect.
   let deviceTtsProvider: TtsProvider | undefined;
   let deviceModel: string | undefined;
+
+  // The hardware device sets config.audioBinary=true to receive TTS as raw-binary
+  // WS frames (16 kHz mono s16le, no base64/JSON wrapper) — ~33% less downlink and
+  // no per-chunk decode on the toy. Negotiated per connection: the web client and
+  // any pre-flash firmware omit the flag and keep the JSON audio_chunk path.
+  let wantsBinaryAudio = false;
+
+  // Emit one PCM audio chunk to this client in its negotiated framing. For binary
+  // clients the metadata (sampleRate/encoding) is implicit (always 16 kHz s16le,
+  // which the device assumes anyway); JSON clients still get it in the frame.
+  const emitAudio = (pcm: Buffer, sampleRate: number, encoding: 'pcm_s16le') => {
+    if (ws.readyState !== ws.OPEN) return;
+    if (wantsBinaryAudio) { ws.send(pcm); return; }
+    ws.send(JSON.stringify({ type: 'audio_chunk', encoding, sampleRate, audioBase64: pcm.toString('base64') }));
+  };
 
   // Per-conversation analytics state
   let convStartedAt = 0;
@@ -288,12 +303,7 @@ wss.on('connection', (ws) => {
       const f = pickFiller();
       if (!f) return;
       logFirstAudio();
-      safeSend(ws, {
-        type: 'audio_chunk',
-        encoding: f.encoding,
-        sampleRate: f.sampleRate,
-        audioBase64: f.pcm.toString('base64'),
-      });
+      emitAudio(f.pcm, f.sampleRate, f.encoding);
       safeSend(ws, { type: 'text_delta', text: f.text + ' ' });
     };
 
@@ -324,12 +334,7 @@ wss.on('connection', (ws) => {
       tts.onChunk((pcm) => {
         if (!pcm.length) return;
         logFirstAudio();
-        safeSend(ws, {
-          type: 'audio_chunk',
-          encoding: tts!.encoding,
-          sampleRate: tts!.sampleRate,
-          audioBase64: pcm.toString('base64'),
-        });
+        emitAudio(pcm, tts!.sampleRate, tts!.encoding);
       });
       return true;
     };
@@ -521,7 +526,8 @@ wss.on('connection', (ws) => {
         tts: msg.tts,
         device_id: msg.device_id,
       };
-      console.log(`[config] device=${msg.device_id ?? '?'} model=${msg.model ?? 'default'} tts=${msg.ttsProvider ?? 'cartesia'}`);
+      wantsBinaryAudio = msg.audioBinary === true;
+      console.log(`[config] device=${msg.device_id ?? '?'} model=${msg.model ?? 'default'} tts=${msg.ttsProvider ?? 'cartesia'} audio=${wantsBinaryAudio ? 'binary' : 'json'}`);
       return;
     }
     if (msg?.type !== 'user_text' || typeof msg.text !== 'string' || !msg.text.trim()) {

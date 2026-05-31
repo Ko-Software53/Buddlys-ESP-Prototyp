@@ -55,8 +55,9 @@ static volatile bool   s_stream_end   = false;  // capture done; flush tail + fi
 static volatile bool   s_stream_cancel = false; // discard utterance (too short/silent)
 
 #define WS_REASSEMBLY_SIZE (64 * 1024)
-static char    *s_ws_buf     = NULL;
-static size_t   s_ws_buf_len = 0;
+static char    *s_ws_buf       = NULL;
+static size_t   s_ws_buf_len   = 0;
+static bool     s_ws_is_binary = false;  // current WS frame is a binary (raw-PCM) audio frame
 
 static volatile uint32_t s_thinking_since_ms = 0;
 static volatile uint32_t s_last_speaking_ms  = 0;
@@ -68,10 +69,16 @@ static volatile bool     s_stream_active     = false;
 static int      s_talk_mode        = TALK_MODE_DEFAULT;
 
 #define JITTER_BUF_SAMPLES  (MIC_SAMPLE_RATE * 8)
-#define JITTER_PREBUF_MS    1500  // prebuffer before playback starts. Long replies stream at only ~1.0x realtime
-                                  // (LLM-token-gated) with ~1s gaps, so a small cushion underruns immediately.
-                                  // 1.5s absorbs that jitter. Short replies arrive at ~6x and flush on stream-end
-                                  // before this fills, so they keep their low latency. Real fix is short replies.
+#define JITTER_PREBUF_MS    700   // prebuffer before playback starts. MEASURED 2026-05-31 against production:
+                                  // the server delivers TTS at 4–8x realtime with a worst inter-chunk gap of
+                                  // ~300ms (NOT the "~1s gaps at 1x realtime" the old 1500ms value assumed —
+                                  // that premise was wrong). 700ms = ~2.3x margin over the measured server gap
+                                  // to absorb toy-side WAN/WiFi/TLS jitter. Because production runs far ahead of
+                                  // playback, the wall-time cost of this cushion is only ~PREBUF/rate (≈90–175ms),
+                                  // not 700ms. Short replies still flush on stream-end before it fills. If real
+                                  // toy-side stutter persists, the cause is a >700ms network/RF STALL (check the
+                                  // monitor for "playback underrun"), not steady-state pacing — raising this back
+                                  // up only hides it behind latency.
 static int16_t       *s_jbuf    = NULL;
 static volatile size_t s_jbuf_wr = 0;
 static volatile size_t s_jbuf_rd = 0;
@@ -447,10 +454,13 @@ static void send_config(void)
 {
     if (!s_ws_connected || !s_ws) return;
 
+    // audioBinary:true → ask the server to send TTS as raw-binary WS frames
+    // instead of base64-JSON audio_chunk. Negotiated per connection, so older
+    // servers (and the web client, which omits the flag) keep the JSON path.
     char *msg = NULL;
     asprintf(&msg,
         "{\"type\":\"config\",\"device_id\":\"%s\",\"model\":\"%s\","
-        "\"reasoning\":\"%s\",\"tts\":true,\"ttsProvider\":\"%s\"}",
+        "\"reasoning\":\"%s\",\"tts\":true,\"ttsProvider\":\"%s\",\"audioBinary\":true}",
         ble_prov_device_id(), BUDDLY_MODEL, BUDDLY_REASONING, BUDDLY_TTS_PROVIDER);
     if (!msg) return;
 
@@ -549,15 +559,34 @@ static void ws_event_handler(void *arg, esp_event_base_t base,
             s_streaming = false; s_stream_end = false; s_stream_cancel = false;
             break;
         case WEBSOCKET_EVENT_DATA:
-            if (ev->op_code == 0x8) break;
-            if (ev->payload_offset == 0) s_ws_buf_len = 0;
+            if (ev->op_code == 0x8) break;   // close frame
+            // Reassemble the (possibly fragmented) frame into s_ws_buf, then
+            // dispatch by type. Audio now arrives as BINARY frames (op_code 0x2)
+            // carrying raw PCM (16 kHz mono s16le) with NO base64/JSON wrapper —
+            // saving ~33% downlink bandwidth and the per-chunk base64 decode on
+            // the toy. Control frames (text_delta/done/error/latency) stay text
+            // JSON. Latch the frame type at its FIRST fragment (payload_offset 0);
+            // continuation fragments may report op_code 0x0, so we must not
+            // re-read the opcode mid-frame.
+            if (ev->payload_offset == 0) {
+                s_ws_buf_len   = 0;
+                s_ws_is_binary = (ev->op_code == 0x2);
+            }
             if (s_ws_buf && s_ws_buf_len + ev->data_len < WS_REASSEMBLY_SIZE) {
                 memcpy(s_ws_buf + s_ws_buf_len, ev->data_ptr, ev->data_len);
                 s_ws_buf_len += ev->data_len;
             }
             if (s_ws_buf_len >= (size_t)ev->payload_len && ev->payload_len > 0) {
-                s_ws_buf[s_ws_buf_len] = '\0';
-                handle_ws_message(s_ws_buf, s_ws_buf_len);
+                if (s_ws_is_binary) {
+                    // Raw-PCM audio chunk → straight into the jitter buffer.
+                    s_thinking_since_ms = 0;
+                    s_stream_active     = true;
+                    s_last_speaking_ms  = now_ms();
+                    play_pcm16_mono((const uint8_t *)s_ws_buf, s_ws_buf_len);
+                } else {
+                    s_ws_buf[s_ws_buf_len] = '\0';
+                    handle_ws_message(s_ws_buf, s_ws_buf_len);
+                }
                 s_ws_buf_len = 0;
             }
             break;
