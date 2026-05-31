@@ -1,14 +1,13 @@
-/**
- * Keep-Warm Cron Job
- *
- * Pingt den Buddlys-Server /health Endpoint an, damit Railway den
- * Haupt-Service nicht einschlafen lässt.
- *
- * Railway-Setup:
- *   - Neuer Service im selben Projekt, selbes Repo
- *   - Start Command:  node cron/keep-warm.mjs
- *   - Cron Schedule:  */2 * * * *
- */
+// Keep-Warm Cron Job
+//
+// Pingt den Buddlys-Server /health Endpoint an, damit Railway den
+// Haupt-Service nicht einschlafen lässt.
+//
+// Railway-Setup:
+//   - Neuer Service im selben Projekt, selbes Repo
+//   - Start Command:  node cron/keep-warm.mjs
+//   - Cron Schedule:  */2 * * * *
+
 
 const URL =
   process.env.HEALTH_URL ||
