@@ -3,6 +3,7 @@
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "freertos/event_groups.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -79,12 +80,19 @@ static int      s_talk_mode        = TALK_MODE_DEFAULT;
                                   // toy-side stutter persists, the cause is a >700ms network/RF STALL (check the
                                   // monitor for "playback underrun"), not steady-state pacing — raising this back
                                   // up only hides it behind latency.
+#define JITTER_REBUF_MS     300   // re-prebuffer after mid-stream underrun (shorter than initial)
 static int16_t       *s_jbuf    = NULL;
 static volatile size_t s_jbuf_wr = 0;
 static volatile size_t s_jbuf_rd = 0;
 
 #define PCM_DECODE_BUF_SIZE (MIC_SAMPLE_RATE * 4)
 static uint8_t *s_pcm_decode_buf = NULL;
+
+// PCM intake queue: decouples WS event handler from the blocking jitter-buffer
+// write, so the WS client task is never stalled by a full ring buffer.
+typedef struct { uint8_t *data; size_t len; } pcm_block_t;
+#define PCM_QUEUE_LEN 32
+static QueueHandle_t s_pcm_queue = NULL;
 
 #define VAD_PREROLL_FRAMES ((size_t)(MIC_SAMPLE_RATE * VAD_PREROLL_MS / 1000))
 static int16_t *s_preroll_buf      = NULL;
@@ -283,21 +291,53 @@ static void play_pcm16_mono(const uint8_t *pcm, size_t byte_len)
     if (!s_jbuf) return;
     const int16_t *mono = (const int16_t *)pcm;
     size_t n = byte_len / sizeof(int16_t);
-    for (size_t i = 0; i < n; ) {
-        size_t next = (s_jbuf_wr + 1) % JITTER_BUF_SAMPLES;
-        if (next == s_jbuf_rd) {
-            // Buffer full: TTS streams faster than realtime, so on long
-            // replies the producer outruns playback. Wait for the playback
-            // task to drain instead of dropping samples — dropped PCM is what
-            // turns long replies into garbled noise. This throttles WS intake
-            // to realtime. Abandon the rest if a barge-in flushed the buffer.
-            if (s_drain_jbuf) return;
-            vTaskDelay(pdMS_TO_TICKS(5));
-            continue;
-        }
-        s_jbuf[s_jbuf_wr] = mono[i++];
+    size_t written = 0;
+    while (written < n) {
+        if (s_drain_jbuf) return;
         __asm__ volatile("memw" ::: "memory");
-        s_jbuf_wr = next;
+        size_t wr = s_jbuf_wr;
+        size_t rd = s_jbuf_rd;
+        // Free slots (1 slot reserved to distinguish full from empty)
+        size_t free_slots = (rd > wr)
+            ? (rd - wr - 1)
+            : (JITTER_BUF_SAMPLES - wr + rd - 1);
+        if (free_slots == 0) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+        size_t batch = n - written;
+        if (batch > free_slots) batch = free_slots;
+        size_t to_end = JITTER_BUF_SAMPLES - wr;
+        if (batch <= to_end) {
+            memcpy(&s_jbuf[wr], &mono[written], batch * sizeof(int16_t));
+        } else {
+            memcpy(&s_jbuf[wr], &mono[written], to_end * sizeof(int16_t));
+            memcpy(&s_jbuf[0], &mono[written + to_end], (batch - to_end) * sizeof(int16_t));
+        }
+        __asm__ volatile("memw" ::: "memory");
+        s_jbuf_wr = (wr + batch) % JITTER_BUF_SAMPLES;
+        written += batch;
+    }
+}
+
+/** Drain the PCM intake queue, freeing all queued blocks (for barge-in). */
+static void flush_pcm_queue(void)
+{
+    if (!s_pcm_queue) return;
+    pcm_block_t blk;
+    while (xQueueReceive(s_pcm_queue, &blk, 0) == pdTRUE) {
+        free(blk.data);
+    }
+}
+
+/** Reads PCM blocks from the intake queue and feeds them into the jitter ring
+ *  buffer. Runs on CPU1 at priority 10 — between the WS client (lower) and
+ *  the playback task (18), so playback always preempts this. */
+static void pcm_feeder_task(void *arg)
+{
+    pcm_block_t blk;
+    while (1) {
+        if (xQueueReceive(s_pcm_queue, &blk, portMAX_DELAY) == pdTRUE) {
+            play_pcm16_mono(blk.data, blk.len);
+            free(blk.data);
+        }
     }
 }
 
@@ -305,17 +345,22 @@ static void playback_task(void *arg)
 {
     const size_t CHUNK  = MIC_SAMPLE_RATE * 30 / 1000;
     const size_t PREBUF = (size_t)(MIC_SAMPLE_RATE * JITTER_PREBUF_MS / 1000);
+    const size_t REBUF  = (size_t)(MIC_SAMPLE_RATE * JITTER_REBUF_MS / 1000);
     bool playing = false;
+    size_t rebuf_target = 0;
     esp_codec_dev_handle_t play = get_playback_handle();
     int16_t stereo[MIC_SAMPLE_RATE * 30 / 1000 * 2];
+    int16_t mono_tmp[MIC_SAMPLE_RATE * 30 / 1000];
 
     while (1) {
         if (s_drain_jbuf) {
             __asm__ volatile("memw" ::: "memory");
             s_jbuf_rd    = s_jbuf_wr;
             playing      = false;
+            rebuf_target = 0;
             s_drain_jbuf = false;
             __asm__ volatile("memw" ::: "memory");
+            flush_pcm_queue();
         }
 
         size_t wr    = s_jbuf_wr;
@@ -323,39 +368,53 @@ static void playback_task(void *arg)
         size_t rd    = s_jbuf_rd;
         size_t avail = (wr >= rd) ? (wr - rd) : (JITTER_BUF_SAMPLES - rd + wr);
 
-        // Re-buffer a full PREBUF cushion at the start of EVERY turn (not just the
-        // first) to absorb network/TTS jitter. The old code latched a `primed`
-        // flag true forever, so only the first reply got a cushion and every later
-        // reply started on a single sample → instant underrun → stutter. Exception:
-        // if the stream already ended, flush a reply shorter than PREBUF right away
-        // instead of waiting for a cushion that will never arrive.
-        if (!playing && avail > 0 && (avail >= PREBUF || !s_stream_active)) {
-            playing = true;
+        // Prebuffer check: wait for enough data before starting/resuming playback.
+        // After a mid-stream underrun, use the shorter REBUF target to minimize
+        // the audible gap while still absorbing jitter.
+        {
+            size_t needed = rebuf_target > 0 ? rebuf_target : PREBUF;
+            if (!playing && avail > 0 && (avail >= needed || !s_stream_active)) {
+                playing = true;
+                rebuf_target = 0;
+            }
         }
 
         // Turn finished and buffer fully drained → stop, re-arming the cushion.
         if (playing && avail == 0 && !s_stream_active) {
             playing = false;
+            rebuf_target = 0;
         }
 
-        // Mid-stream underrun (more audio expected but buffer empty) = the stutter.
-        // Log it (throttled) so a persistent problem is visible in the monitor.
+        // Mid-stream underrun: pause playback and re-prebuffer with a shorter
+        // cushion instead of continuing with zero margin (which cascades).
         if (playing && avail == 0 && s_stream_active) {
+            playing = false;
+            rebuf_target = REBUF;
             static uint32_t s_last_underrun_ms = 0;
             if (now_ms() - s_last_underrun_ms >= 500) {
                 s_last_underrun_ms = now_ms();
-                ESP_LOGW(TAG, "playback underrun (jbuf empty mid-stream)");
+                ESP_LOGW(TAG, "playback underrun — re-prebuffering %ums",
+                         (unsigned)JITTER_REBUF_MS);
             }
         }
 
         if (playing) {
             size_t n = avail < CHUNK ? avail : CHUNK;
+            // Block-read from ring buffer, then mono→stereo duplication.
+            // One memcpy (or two at wrap-around) + one barrier replaces the
+            // per-sample memw loop that was burning ~16k barriers/second.
+            size_t to_end = JITTER_BUF_SAMPLES - rd;
+            if (n <= to_end) {
+                memcpy(mono_tmp, &s_jbuf[rd], n * sizeof(int16_t));
+            } else {
+                memcpy(mono_tmp, &s_jbuf[rd], to_end * sizeof(int16_t));
+                memcpy(&mono_tmp[to_end], &s_jbuf[0], (n - to_end) * sizeof(int16_t));
+            }
+            __asm__ volatile("memw" ::: "memory");
+            s_jbuf_rd = (rd + n) % JITTER_BUF_SAMPLES;
             for (size_t i = 0; i < n; i++) {
-                int16_t s = s_jbuf[s_jbuf_rd];
-                __asm__ volatile("memw" ::: "memory");
-                s_jbuf_rd = (s_jbuf_rd + 1) % JITTER_BUF_SAMPLES;
-                stereo[i * 2]     = s;
-                stereo[i * 2 + 1] = s;
+                stereo[i * 2]     = mono_tmp[i];
+                stereo[i * 2 + 1] = mono_tmp[i];
             }
             memset(&stereo[n * 2], 0, (CHUNK - n) * 2 * sizeof(int16_t));
             if (n > 0) s_last_speaking_ms = now_ms();
@@ -517,8 +576,18 @@ static void handle_ws_message(const char *data, size_t len)
             if (s_pcm_decode_buf && out_len <= PCM_DECODE_BUF_SIZE) {
                 size_t actual = 0;
                 if (mbedtls_base64_decode(s_pcm_decode_buf, out_len, &actual,
-                    (const unsigned char *)b64, b64_len) == 0 && actual > 0)
-                    play_pcm16_mono(s_pcm_decode_buf, actual);
+                    (const unsigned char *)b64, b64_len) == 0 && actual > 0) {
+                    pcm_block_t blk;
+                    blk.data = heap_caps_malloc(actual, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                    if (blk.data) {
+                        memcpy(blk.data, s_pcm_decode_buf, actual);
+                        blk.len = actual;
+                        if (xQueueSend(s_pcm_queue, &blk, 0) != pdTRUE) {
+                            free(blk.data);
+                            ESP_LOGW(TAG, "pcm queue full — dropped chunk");
+                        }
+                    }
+                }
             }
         }
     } else if (strcmp(type, "text_delta") == 0) {
@@ -582,7 +651,18 @@ static void ws_event_handler(void *arg, esp_event_base_t base,
                     s_thinking_since_ms = 0;
                     s_stream_active     = true;
                     s_last_speaking_ms  = now_ms();
-                    play_pcm16_mono((const uint8_t *)s_ws_buf, s_ws_buf_len);
+                    {
+                        pcm_block_t blk;
+                        blk.data = heap_caps_malloc(s_ws_buf_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                        if (blk.data) {
+                            memcpy(blk.data, s_ws_buf, s_ws_buf_len);
+                            blk.len = s_ws_buf_len;
+                            if (xQueueSend(s_pcm_queue, &blk, 0) != pdTRUE) {
+                                free(blk.data);
+                                ESP_LOGW(TAG, "pcm queue full — dropped chunk");
+                            }
+                        }
+                    }
                 } else {
                     s_ws_buf[s_ws_buf_len] = '\0';
                     handle_ws_message(s_ws_buf, s_ws_buf_len);
@@ -601,7 +681,7 @@ static void ws_connect(const char *uri)
 {
     esp_websocket_client_config_t cfg = {
         .uri                  = uri,
-        .buffer_size          = 4096,
+        .buffer_size          = 8192,
         .reconnect_timeout_ms = 10000,
         .network_timeout_ms   = 10000,
         // Verify the server cert against the built-in CA bundle for wss://.
@@ -957,6 +1037,10 @@ void app_main(void)
     // Pinned to CPU0 (same core as the capture loop) so the producer/consumer
     // index ordering on s_rec_buf holds without explicit memory barriers.
     xTaskCreatePinnedToCore(audio_sender_task, "audio_tx", 4096, NULL, 6, NULL, 0);
+    // PCM intake queue + feeder task: decouples WS event handler from the
+    // blocking jitter-buffer write so WS reception is never stalled.
+    s_pcm_queue = xQueueCreate(PCM_QUEUE_LEN, sizeof(pcm_block_t));
+    xTaskCreatePinnedToCore(pcm_feeder_task, "pcm_feed", 4096, NULL, 10, NULL, 1);
 
     wifi_driver_init();
 

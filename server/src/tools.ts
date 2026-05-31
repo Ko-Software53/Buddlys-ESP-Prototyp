@@ -47,10 +47,13 @@ export const TOOL_DEFS: MistralToolDef[] = [
     function: {
       name: 'web_search',
       description:
-        'Sucht aktuelle Fakten im Web. Verwende dies, wenn das Kind nach ' +
-        'aktuellem Wissen fragt (Datum-spezifisch, Nachrichten, Wetter, ' +
-        'Bedeutungen, "Wer ist …", "Was ist heute …"). Nicht bei Mathe ' +
-        '(da nimm den calculator) und nicht bei Gefühls-/Smalltalk-Fragen.',
+        'Sucht aktuelle Fakten im Web. Verwende dies IMMER wenn das Kind nach ' +
+        'aktuellem Wissen fragt (Nachrichten, Wetter, Bedeutungen, "Wer ist …", ' +
+        '"Was ist heute …", Sportergebnisse, Promis, Politik) ODER wenn du dir ' +
+        'bei einer Faktenfrage nicht hundertprozentig sicher bist. Die Ergebnisse ' +
+        'enthalten mehrere Quellen mit Titeln und URLs. Stütze deine Antwort ' +
+        'NUR auf das, was die Quellen bestätigen — erfinde nichts dazu. ' +
+        'Nicht bei Mathe (da nimm den calculator) und nicht bei Gefühls-/Smalltalk-Fragen.',
       parameters: {
         type: 'object',
         properties: {
