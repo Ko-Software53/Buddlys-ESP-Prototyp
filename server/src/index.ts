@@ -29,6 +29,7 @@ import { openMistralTtsSession } from './mistralTts.js';
 import { openOmniVoiceSession } from './omnivoiceTts.js';
 import { SentenceChunker } from './chunker.js';
 import { preloadFillers, pickFiller } from './fillerCache.js';
+import { startKeepWarm } from './keepWarm.js';
 import { spellOutNumbers } from './numberToWords.js';
 import { getDeviceConfig, touchDevice, updateDeviceBattery, createConversation, appendMessage, finalizeConversation, tagConversation, flagConversation } from './supabase.js';
 
@@ -556,4 +557,7 @@ server.listen(PORT, () => {
   );
   // Filler-Audios im Hintergrund vorrendern (blockiert nichts).
   void preloadFillers();
+
+  // Keep the server warm — self-ping /health every 2 min to prevent cold shutdowns.
+  startKeepWarm(PORT);
 });

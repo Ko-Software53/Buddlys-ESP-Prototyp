@@ -51,7 +51,12 @@
 
 // VAD settings — thresholds are in post-software-gain RMS units
 #define VAD_SPEECH_THRESHOLD    800   // RMS to trigger speech onset (lower = wakes on quieter speech)
-#define VAD_CONTINUE_THRESHOLD  300   // RMS to keep an active turn alive; below this counts toward end-of-turn silence
+#define VAD_CONTINUE_THRESHOLD  500   // RMS to keep an active turn alive; below this counts toward end-of-turn silence.
+                                      // MEASURED 2026-05-31: with the high mic gain (30dB+4x) the ambient NOISE FLOOR reads
+                                      // ~200–350 RMS, so the old 300 let noise keep resetting the silence timer → turns never
+                                      // ended → ran to the 15s buffer cap and uploaded huge recordings. Real continued speech
+                                      // sits well above 500 (onset gate is 800); 500 lets the ~350 noise floor count as silence
+                                      // so end-of-speech actually fires. If a noisy room still won't end turns, raise toward 600.
 #define VAD_SILENCE_MS          600   // ms below the continue threshold before the turn ends (higher = tolerates mid-sentence pauses like "uhm").
                                       // This is pure dead time after the child stops talking, ON the critical path before STT even starts —
                                       // every ms here is felt as latency. 600 still tolerates short pauses; drop toward 450 if kids feel cut off rarely.
