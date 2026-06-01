@@ -301,7 +301,7 @@ wss.on('connection', (ws) => {
     // later chunks are delayed. Chunks are serialized on a promise chain so they
     // keep order and the accumulated delay is correct regardless of how fast the
     // TTS onChunk callback fires.
-    const AUDIO_LEAD_MS = 4000;
+    const AUDIO_LEAD_MS = 6500;
     let emittedAudioMs = 0;          // total audio duration enqueued this turn (ms)
     let firstEmitAt = 0;             // wall-clock of the first emitted chunk
     let paceChain: Promise<void> = Promise.resolve();

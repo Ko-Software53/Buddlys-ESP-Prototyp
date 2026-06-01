@@ -47,7 +47,17 @@
 
 // Boot talk mode: 0 = push-to-talk, 1 = VAD (always-on listening)
 // Long-press the power button at runtime to toggle between modes.
-#define TALK_MODE_DEFAULT       1
+#define TALK_MODE_DEFAULT       0
+
+// ─── Warm-up gate (post-deep-sleep robustness) ──────────────────────────────
+// After a deep-sleep wake the WiFi radio is briefly marginal (partial recal, AP
+// re-association, DHCP). Letting the child talk into that window causes the
+// dropped-connection + stutter seen on wake. So the toy holds off "ready" until
+// the link is genuinely solid, and plays a spoken status clip in the meantime.
+#define WARMUP_AUDIO_FEEDBACK   1     // 1 = play embedded voice clips on connect/reconnect
+#define WIFI_READY_RSSI_DBM     (-78) // link counts as solid at/above this RSSI (dBm; closer to 0 = stronger)
+#define WIFI_READY_SETTLE_MS    800   // RSSI must stay solid this long before the toy goes "ready"
+#define WIFI_READY_MAX_WAIT_MS  4000  // hard cap: go ready anyway this long after WS connects (weak-but-working link)
 
 // VAD settings — thresholds are in post-software-gain RMS units
 #define VAD_SPEECH_THRESHOLD    800   // RMS to trigger speech onset (lower = wakes on quieter speech)

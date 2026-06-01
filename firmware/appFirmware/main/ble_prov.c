@@ -1,5 +1,6 @@
 #include "ble_prov.h"
 #include "nvs_config.h"
+#include "settings.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -182,7 +183,10 @@ static int cb_config(uint16_t conn, uint16_t attr,
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    uint16_t port = cJSON_IsNumber(port_j) ? (uint16_t)port_j->valueint : 3001;
+    uint16_t port = SERVER_PORT;
+    if (cJSON_IsNumber(port_j) && port_j->valueint > 0 && port_j->valueint <= 65535) {
+        port = (uint16_t)port_j->valueint;
+    }
     bool saved = nvs_save_wifi_config(ssid_j->valuestring, pass_j->valuestring,
                                       host_j->valuestring, port);
     cJSON_Delete(root);

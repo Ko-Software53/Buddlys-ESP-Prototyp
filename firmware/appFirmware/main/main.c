@@ -33,6 +33,7 @@ static EventGroupHandle_t s_wifi_eg;
 
 static esp_websocket_client_handle_t s_ws = NULL;
 static bool s_ws_connected = false;
+static volatile bool s_ws_started = false;
 static volatile bool s_config_sent = false;
 static bool s_recording    = false;
 static int16_t *s_rec_buf  = NULL;
@@ -66,21 +67,13 @@ static volatile uint32_t s_error_until_ms    = 0;
 static uint32_t          s_last_batt_ms      = 0;
 static volatile bool     s_drain_jbuf        = false;
 static volatile bool     s_stream_active     = false;
+static esp_netif_t      *s_sta_netif         = NULL;
 
 static int      s_talk_mode        = TALK_MODE_DEFAULT;
 
 #define JITTER_BUF_SAMPLES  (MIC_SAMPLE_RATE * 8)
-#define JITTER_PREBUF_MS    700   // prebuffer before playback starts. MEASURED 2026-05-31 against production:
-                                  // the server delivers TTS at 4–8x realtime with a worst inter-chunk gap of
-                                  // ~300ms (NOT the "~1s gaps at 1x realtime" the old 1500ms value assumed —
-                                  // that premise was wrong). 700ms = ~2.3x margin over the measured server gap
-                                  // to absorb toy-side WAN/WiFi/TLS jitter. Because production runs far ahead of
-                                  // playback, the wall-time cost of this cushion is only ~PREBUF/rate (≈90–175ms),
-                                  // not 700ms. Short replies still flush on stream-end before it fills. If real
-                                  // toy-side stutter persists, the cause is a >700ms network/RF STALL (check the
-                                  // monitor for "playback underrun"), not steady-state pacing — raising this back
-                                  // up only hides it behind latency.
-#define JITTER_REBUF_MS     300   // re-prebuffer after mid-stream underrun (shorter than initial)
+#define JITTER_PREBUF_MS    1500  // absorb real WAN/TTS/WiFi gaps before playback starts
+#define JITTER_REBUF_MS     900   // re-prebuffer after mid-stream underrun without restarting too early
 static int16_t       *s_jbuf    = NULL;
 static volatile size_t s_jbuf_wr = 0;
 static volatile size_t s_jbuf_rd = 0;
@@ -138,6 +131,11 @@ static void led_init(void)
 
 static volatile bool s_ble_provisioning = false;
 static volatile bool s_wifi_connecting  = false;
+static volatile bool s_wifi_has_ip      = false;
+// Warm-up gate: false until the link is solid enough to take a turn. While false
+// the toy ignores the mic/button so the child can't talk into a half-connected
+// radio (the post-deep-sleep failure mode). See the main loop.
+static volatile bool s_app_ready        = false;
 
 static void led_task(void *arg)
 {
@@ -146,7 +144,8 @@ static void led_task(void *arg)
 
         if (s_ble_provisioning) {
             led_set((now / 300) & 1 ? LEDC_CYAN : LEDC_OFF);
-        } else if (s_wifi_connecting) {
+        } else if (s_wifi_connecting || !s_app_ready) {
+            // Warming up: connecting / waiting for a solid link before "ready".
             led_set((now / 200) & 1 ? LEDC_YELLOW : LEDC_OFF);
         } else if (s_error_until_ms && now < s_error_until_ms) {
             led_set((now / 100) & 1 ? LEDC_RED : LEDC_OFF);
@@ -173,6 +172,16 @@ static void on_wifi_got_ip(void *arg, esp_event_base_t base, int32_t id, void *d
     char ip[20];
     snprintf(ip, sizeof(ip), IPSTR, IP2STR(&ev->ip_info.ip));
     ESP_LOGI(TAG, "WiFi connected, IP=%s", ip);
+    if (s_sta_netif) {
+        esp_netif_dns_info_t dns = {0};
+        dns.ip.type = IPADDR_TYPE_V4;
+        dns.ip.u_addr.ip4.addr = esp_ip4addr_aton("1.1.1.1");
+        esp_err_t dns_err = esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_FALLBACK, &dns);
+        if (dns_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to set fallback DNS: %s", esp_err_to_name(dns_err));
+        }
+    }
+    s_wifi_has_ip = true;
     ble_prov_notify_wifi_status("connected", ip);
     xEventGroupSetBits(s_wifi_eg, WIFI_CONNECTED_BIT);
 }
@@ -182,7 +191,11 @@ static volatile bool s_wifi_established = false;
 static void on_wifi_disconnect(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     ESP_LOGW(TAG, "WiFi disconnected");
+    s_wifi_has_ip = false;
     s_ws_connected = false;
+    s_config_sent = false;
+    s_app_ready = false;
+    xEventGroupClearBits(s_wifi_eg, WIFI_CONNECTED_BIT);
     // Retry on disconnect during the INITIAL connect too, not only after a
     // connection was once established. Some APs (e.g. WPA3 WLAN-65QWSM) answer
     // the first association with "refused temporarily"; without this retry the
@@ -199,7 +212,7 @@ static void wifi_driver_init(void)
     s_wifi_eg = xEventGroupCreate();
     esp_netif_init();
     esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
+    s_sta_netif = esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
@@ -224,6 +237,7 @@ static void wifi_driver_init(void)
 static bool wifi_connect(const char *ssid, const char *pass)
 {
     s_wifi_connecting = true;
+    s_wifi_has_ip = false;
     xEventGroupClearBits(s_wifi_eg, WIFI_CONNECTED_BIT);
 
     wifi_config_t wc = { .sta = { .threshold.authmode = WIFI_AUTH_WPA2_PSK } };
@@ -315,6 +329,34 @@ static void play_pcm16_mono(const uint8_t *pcm, size_t byte_len)
         s_jbuf_wr = (wr + batch) % JITTER_BUF_SAMPLES;
         written += batch;
     }
+}
+
+// ─── Embedded voice feedback clips ──────────────────────────────────────────
+// Spoken status messages in Buddly's own Cartesia voice, baked into the binary
+// via EMBED_FILES (CMakeLists.txt) as raw 16 kHz mono s16le PCM. Generated by
+// server/scripts/gen_feedback_clips.mjs. Played LOCALLY (no network) so the toy
+// can reassure the child while the WiFi/WebSocket link is still coming up.
+extern const uint8_t clip_waking_start[]    asm("_binary_clip_waking_pcm_start");
+extern const uint8_t clip_waking_end[]      asm("_binary_clip_waking_pcm_end");
+extern const uint8_t clip_ready_start[]     asm("_binary_clip_ready_pcm_start");
+extern const uint8_t clip_ready_end[]       asm("_binary_clip_ready_pcm_end");
+extern const uint8_t clip_reconnect_start[] asm("_binary_clip_reconnect_pcm_start");
+extern const uint8_t clip_reconnect_end[]   asm("_binary_clip_reconnect_pcm_end");
+
+/** Play an embedded PCM clip through the normal jitter-buffered playback path.
+ *  Non-blocking for clips up to the 8 s buffer. Skipped while a live server turn
+ *  is streaming so local feedback never collides with Buddly's reply. */
+static void play_clip(const uint8_t *start, const uint8_t *end)
+{
+#if WARMUP_AUDIO_FEEDBACK
+    if (!start || end <= start || s_stream_active) return;
+    play_pcm16_mono(start, (size_t)(end - start));
+    // Hold the mic suppressed (half-duplex, no AEC) until the clip drains; the
+    // playback task keeps bumping s_last_speaking_ms while it actually plays.
+    s_last_speaking_ms = now_ms();
+#else
+    (void)start; (void)end;
+#endif
 }
 
 /** Drain the PCM intake queue, freeing all queued blocks (for barge-in). */
@@ -673,8 +715,50 @@ static void ws_event_handler(void *arg, esp_event_base_t base,
         case WEBSOCKET_EVENT_ERROR:
             ESP_LOGE(TAG, "WS error");
             break;
+        case WEBSOCKET_EVENT_FINISH:
+            ESP_LOGI(TAG, "WS task finished");
+            s_ws_started = false;
+            break;
         default: break;
     }
+}
+
+static void ws_reset_runtime_state(void)
+{
+    s_ws_connected  = false;
+    s_stream_active = false;
+    s_ws_buf_len    = 0;
+    s_config_sent   = false;
+    s_streaming = false; s_stream_end = false; s_stream_cancel = false;
+}
+
+static void ws_start_if_wifi_ready(void)
+{
+    static uint32_t last_start_attempt_ms = 0;
+    uint32_t now = now_ms();
+    if (!s_ws || s_ws_started || !s_wifi_has_ip) return;
+    if (last_start_attempt_ms && now - last_start_attempt_ms < 1000) return;
+    last_start_attempt_ms = now;
+
+    ESP_LOGI(TAG, "Starting WS");
+    esp_err_t err = esp_websocket_client_start(s_ws);
+    if (err == ESP_OK) {
+        s_ws_started = true;
+    } else {
+        ESP_LOGW(TAG, "WS start failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void ws_stop_until_wifi_returns(void)
+{
+    if (!s_ws || !s_ws_started) return;
+    ESP_LOGW(TAG, "Stopping WS until WiFi has IP");
+    esp_err_t err = esp_websocket_client_stop(s_ws);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "WS stop failed: %s", esp_err_to_name(err));
+    }
+    s_ws_started = false;
+    ws_reset_runtime_state();
 }
 
 static void ws_connect(const char *uri)
@@ -682,16 +766,25 @@ static void ws_connect(const char *uri)
     esp_websocket_client_config_t cfg = {
         .uri                  = uri,
         .buffer_size          = 8192,
-        .reconnect_timeout_ms = 10000,
-        .network_timeout_ms   = 10000,
+        // Retry quickly after a true disconnect, but do not declare a slow TTS
+        // audio frame dead after only a few seconds. Railway/Cartesia/WiFi can
+        // occasionally stall long enough to underrun playback while the socket is
+        // still valid; a short read timeout turns that into a false reconnect.
+        .reconnect_timeout_ms = 1000,
+        .network_timeout_ms   = 20000,
         // Verify the server cert against the built-in CA bundle for wss://.
         // Ignored for plain ws:// URIs, so it's safe to always attach.
         .crt_bundle_attach    = esp_crt_bundle_attach,
+        .enable_close_reconnect = true,
     };
     s_ws = esp_websocket_client_init(&cfg);
+    if (!s_ws) {
+        ESP_LOGE(TAG, "WS init failed");
+        return;
+    }
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY,
                                   ws_event_handler, NULL);
-    esp_websocket_client_start(s_ws);
+    ws_start_if_wifi_ready();
 }
 
 // ─── Mode toggle ──────────────────────────────────────────────────────────
@@ -1074,7 +1167,31 @@ void app_main(void)
             nvs_clear_wifi_config();
         }
     } else {
-        wifi_connect(wifi_ssid, wifi_pass);
+        // Talk to the child right away ("Einen Moment, ich wache auf.") so the
+        // ~1–4 s connect/warm-up after a deep-sleep wake feels intentional, not
+        // broken. Non-blocking: it plays over the speaker while we connect below.
+        play_clip(clip_waking_start, clip_waking_end);
+        bool wifi_ok = false;
+        for (int attempt = 1; attempt <= 3 && !wifi_ok; attempt++) {
+            wifi_ok = wifi_connect(wifi_ssid, wifi_pass);
+            if (!wifi_ok && attempt < 3) {
+                ESP_LOGW(TAG, "WiFi connect failed (%d/3) — retrying before provisioning reset", attempt);
+                vTaskDelay(pdMS_TO_TICKS(3000));
+            }
+        }
+        if (!wifi_ok) {
+            if (nvs_ok && strlen(WIFI_SSID) == 0) {
+                ESP_LOGW(TAG, "Saved WiFi config failed — clearing it and restarting provisioning");
+                nvs_clear_wifi_config();
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                esp_restart();
+            }
+            while (!wifi_ok) {
+                ESP_LOGW(TAG, "Built-in WiFi config failed — retrying");
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                wifi_ok = wifi_connect(wifi_ssid, wifi_pass);
+            }
+        }
     }
 
     strncpy(s_srv_host, srv_host, sizeof(s_srv_host) - 1);
@@ -1092,15 +1209,66 @@ void app_main(void)
              s_talk_mode ? "VAD" : "push-to-talk");
 
     bool last_pressed = false;
+    bool prev_ws_connected   = false;
+    uint32_t rssi_ok_since   = 0;
+    uint32_t ws_conn_since   = 0;
 
     while (1) {
         handle_power_button();
+
+        if (!s_wifi_has_ip) {
+            ws_stop_until_wifi_returns();
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        ws_start_if_wifi_ready();
 
         // Send per-device config once after each (re)connect so the server can
         // run binary-audio turns with the right model/voice/device_id.
         if (s_ws_connected && !s_config_sent) {
             send_config();
             s_config_sent = true;
+        }
+
+        // ─── Warm-up gate ───────────────────────────────────────────────────
+        // The toy stays "not ready" (mic/button ignored) until the link is
+        // solid, so the child can't talk into the marginal radio right after a
+        // deep-sleep wake — the root cause of the dropped-connection + stutter.
+        // Track WS connection edges to drive spoken feedback.
+        if (s_ws_connected && !prev_ws_connected) {
+            ws_conn_since = now_ms();
+            rssi_ok_since = 0;
+        } else if (!s_ws_connected && prev_ws_connected && s_app_ready) {
+            // Lost the link mid-session → pause turns and reassure the child.
+            ESP_LOGW(TAG, "Link lost — pausing until reconnect");
+            play_clip(clip_reconnect_start, clip_reconnect_end);
+            s_app_ready = false;
+        }
+        prev_ws_connected = s_ws_connected;
+
+        if (!s_app_ready) {
+            if (s_ws_connected && s_config_sent) {
+                int rssi = 0;
+                bool rssi_solid = (esp_wifi_sta_get_rssi(&rssi) == ESP_OK &&
+                                   rssi >= WIFI_READY_RSSI_DBM);
+                if (rssi_solid) {
+                    if (rssi_ok_since == 0) rssi_ok_since = now_ms();
+                } else {
+                    rssi_ok_since = 0;
+                }
+                bool settled = rssi_ok_since && now_ms() - rssi_ok_since >= WIFI_READY_SETTLE_MS;
+                bool capped  = now_ms() - ws_conn_since >= WIFI_READY_MAX_WAIT_MS;
+                if (settled || capped) {
+                    ESP_LOGI(TAG, "Warm-up done (rssi=%d settled=%d capped=%d) — ready",
+                             rssi, settled, capped);
+                    play_clip(clip_ready_start, clip_ready_end);
+                    s_app_ready = true;
+                }
+            }
+            if (!s_app_ready) {
+                vTaskDelay(pdMS_TO_TICKS(50));  // stay responsive to the power button
+                continue;
+            }
         }
 
         if (BATTERY_REPORT_ENABLED && s_ws_connected &&
