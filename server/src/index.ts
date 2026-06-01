@@ -291,6 +291,37 @@ wss.on('connection', (ws) => {
 
     let tts: TtsSession | null = null;
 
+    // Paced audio emit. TTS produces audio FASTER than realtime, but the toy can
+    // only buffer ~8s (jitter ring `s_jbuf` + 32-block intake queue). Dumping a
+    // long reply at once overruns it → "pcm queue full — dropped chunk" on the
+    // device → audio cuts out mid-sentence. So we throttle sends to stay at most
+    // AUDIO_LEAD_MS ahead of realtime playback: in-flight audio is bounded well
+    // under the toy's buffer (no drops) while a multi-second lead keeps a big
+    // jitter cushion (no underrun). First-audio latency is unchanged — only the
+    // later chunks are delayed. Chunks are serialized on a promise chain so they
+    // keep order and the accumulated delay is correct regardless of how fast the
+    // TTS onChunk callback fires.
+    const AUDIO_LEAD_MS = 4000;
+    let emittedAudioMs = 0;          // total audio duration enqueued this turn (ms)
+    let firstEmitAt = 0;             // wall-clock of the first emitted chunk
+    let paceChain: Promise<void> = Promise.resolve();
+
+    const pacedEmit = (pcm: Buffer, sampleRate: number, encoding: 'pcm_s16le') => {
+      const durMs = (pcm.length / 2 / sampleRate) * 1000; // s16le mono: 2 bytes/sample
+      const myAudioMs = emittedAudioMs;                   // this chunk's start offset
+      emittedAudioMs += durMs;
+      paceChain = paceChain.then(async () => {
+        if (ws.readyState !== ws.OPEN) return;
+        if (!firstEmitAt) firstEmitAt = Date.now();
+        const aheadMs = myAudioMs - (Date.now() - firstEmitAt);
+        if (aheadMs > AUDIO_LEAD_MS) {
+          await new Promise((r) => setTimeout(r, aheadMs - AUDIO_LEAD_MS));
+          if (ws.readyState !== ws.OPEN) return;
+        }
+        emitAudio(pcm, sampleRate, encoding);
+      });
+    };
+
     const logFirstAudio = () => {
       if (firstAudioLogged) return;
       firstAudioLogged = true;
@@ -303,7 +334,7 @@ wss.on('connection', (ws) => {
       const f = pickFiller();
       if (!f) return;
       logFirstAudio();
-      emitAudio(f.pcm, f.sampleRate, f.encoding);
+      pacedEmit(f.pcm, f.sampleRate, f.encoding);
       safeSend(ws, { type: 'text_delta', text: f.text + ' ' });
     };
 
@@ -334,7 +365,7 @@ wss.on('connection', (ws) => {
       tts.onChunk((pcm) => {
         if (!pcm.length) return;
         logFirstAudio();
-        emitAudio(pcm, tts!.sampleRate, tts!.encoding);
+        pacedEmit(pcm, tts!.sampleRate, tts!.encoding);
       });
       return true;
     };
@@ -439,6 +470,12 @@ wss.on('connection', (ws) => {
         convHadTtsError = true;
         safeSend(ws, { type: 'error', message: `tts produced no audio (${ttsProvider})` });
       }
+
+      // All chunks are enqueued, but pacing may still be holding back the tail.
+      // Wait for the paced queue to flush before `done` — `done` tells the toy
+      // the stream is over (s_stream_active=false), so it must not race ahead of
+      // the throttled final chunks or the end of the reply gets cut.
+      await paceChain;
 
       sendLatency(ws, 'total', Date.now() - t0);
       safeSend(ws, { type: 'done' });
