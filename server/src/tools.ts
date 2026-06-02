@@ -25,10 +25,10 @@ export const TOOL_DEFS: MistralToolDef[] = [
     function: {
       name: 'calculator',
       description:
-        'Rechnet Mathe-Ausdrücke aus. Nutze dies NUR für Rechnungen, die du nicht ' +
-        'sofort im Kopf weißt: große Zahlen (ab ca. dreistellig), Quadratzahlen, ' +
-        'Wurzeln, Prozent, mehrere Rechenschritte. Einfaches Kopfrechnen mit kleinen ' +
-        'Zahlen (z. B. 3 + 5, 10 − 4, 2 × 6) machst du direkt ohne Tool.',
+        'Rechnet Mathe-Ausdrücke aus. Nutze dies IMMER und AUSNAHMSLOS für JEDE Rechnung, ' +
+        'die das Kind dir stellt oder die du überprüfen musst. Egal wie einfach ' +
+        'die Rechnung erscheint (selbst 3 + 5 oder 10 - 4), versuche niemals, ' +
+        'es im Kopf auszurechnen. Rufe immer zuerst dieses Tool auf!',
       parameters: {
         type: 'object',
         properties: {
