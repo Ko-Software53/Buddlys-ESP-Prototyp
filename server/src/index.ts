@@ -78,6 +78,23 @@ app.post(
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
+// ─── Process-level safety net ───────────────────────────────────────────────
+// This is a multi-client realtime server: every connected toy shares ONE Node
+// process. On modern Node an unhandled promise rejection terminates the process
+// by default — so a single rejected fire-and-forget promise (e.g. a Supabase
+// write in `void appendMessage(...)`, a TTS/STT fetch) would crash the server
+// and drop EVERY toy's WebSocket at once (the toys then see a 1006 close and
+// reconnect). One bad background write must never do that. Log and keep serving
+// instead. (uncaughtException is logged too; we deliberately do NOT exit, since
+// exiting is exactly the "drop everyone" failure we're preventing — the known
+// risks here are async rejections, where process state stays intact.)
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+});
+
 type ReasoningMode = 'auto' | 'always' | 'never';
 type TtsProvider = 'cartesia' | 'mistral' | 'omnivoice';
 
