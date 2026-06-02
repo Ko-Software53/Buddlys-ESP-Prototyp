@@ -144,6 +144,15 @@ function fixTtsNumbers(text: string): string {
 wss.on('connection', (ws) => {
   console.log('[ws] client connected');
 
+  // Keep the connection alive with pings every 5 seconds.
+  // This prevents the ESP32's 20-second network_timeout_ms from dropping the connection
+  // if the STT or LLM takes longer than 20 seconds to respond.
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === ws.OPEN) {
+      ws.ping();
+    }
+  }, 5000);
+
   const session = new ConversationSession();
   const sessionStart = Date.now();
   let sessionPromptTokens = 0;
@@ -384,7 +393,7 @@ wss.on('connection', (ws) => {
         if (!ttsEnabled || !await ensureTts()) return;
         const cleaned = fixTtsNumbers(text);
         if (isSpeakable(cleaned)) tts!.send(cleaned, isFinal);
-        else if (isFinal) tts!.send(' ', true);
+        else if (isFinal) tts!.send('', true);
       };
 
       for await (const ev of session.send(p.text, { reasoning, model, temperature })) {
@@ -446,11 +455,14 @@ wss.on('connection', (ws) => {
         if (tail) {
           await pushChunk(tail, true);
         } else if (await ensureTts()) {
-          tts!.send(' ', true);
+          tts!.send('', true);
         }
         const doneTts = tts as TtsSession | null;
         if (doneTts) {
-          await doneTts.done;
+          await Promise.race([
+            doneTts.done,
+            new Promise((r) => setTimeout(r, 10000))
+          ]);
           sendLatency(ws, 'tts done', Date.now() - t0);
         }
       }
@@ -582,6 +594,7 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
+    clearInterval(pingInterval);
     finalizeCurrent();
     console.log('[ws] client disconnected');
   });

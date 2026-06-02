@@ -81,9 +81,12 @@ export async function openCartesiaSession(
     rejectDone = rej;
   });
   let finished = false;
+  let keepAliveInterval: NodeJS.Timeout | null = null;
+  
   const finish = (err?: Error) => {
     if (finished) return;
     finished = true;
+    if (keepAliveInterval) clearInterval(keepAliveInterval);
     if (err) rejectDone(err);
     else resolveDone();
     try {
@@ -92,6 +95,14 @@ export async function openCartesiaSession(
       // egal
     }
   };
+
+  ws.on('open', () => {
+    keepAliveInterval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        try { ws.ping(); } catch {}
+      }
+    }, 4000);
+  });
 
   ws.on('message', (raw) => {
     let msg: { type?: string; data?: string; error?: string; context_id?: string };

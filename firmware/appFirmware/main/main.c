@@ -561,7 +561,7 @@ static void send_config(void)
     char *msg = NULL;
     asprintf(&msg,
         "{\"type\":\"config\",\"device_id\":\"%s\",\"model\":\"%s\","
-        "\"reasoning\":\"%s\",\"tts\":true,\"ttsProvider\":\"%s\",\"audioBinary\":true}",
+        "\"reasoning\":\"%s\",\"tts\":true,\"ttsProvider\":\"%s\",\"audioBinary\":false}",
         ble_prov_device_id(), BUDDLY_MODEL, BUDDLY_REASONING, BUDDLY_TTS_PROVIDER);
     if (!msg) return;
 
@@ -683,33 +683,51 @@ static void ws_event_handler(void *arg, esp_event_base_t base,
                 s_ws_buf_len   = 0;
                 s_ws_is_binary = (ev->op_code == 0x2);
             }
-            if (s_ws_buf && s_ws_buf_len + ev->data_len < WS_REASSEMBLY_SIZE) {
-                memcpy(s_ws_buf + s_ws_buf_len, ev->data_ptr, ev->data_len);
-                s_ws_buf_len += ev->data_len;
-            }
-            if (s_ws_buf_len >= (size_t)ev->payload_len && ev->payload_len > 0) {
-                if (s_ws_is_binary) {
-                    // Raw-PCM audio chunk → straight into the jitter buffer.
+
+            if (s_ws_is_binary) {
+                // Audio is pushed DIRECTLY to the jitter buffer per network fragment.
+                // This mimics the Web Client architecture, bypassing the 64KB
+                // WS_REASSEMBLY_SIZE limit which caused large TTS chunks to be dropped.
+                if (ev->data_len > 0) {
                     s_thinking_since_ms = 0;
                     s_stream_active     = true;
                     s_last_speaking_ms  = now_ms();
-                    {
-                        pcm_block_t blk;
-                        blk.data = heap_caps_malloc(s_ws_buf_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                        if (blk.data) {
-                            memcpy(blk.data, s_ws_buf, s_ws_buf_len);
-                            blk.len = s_ws_buf_len;
-                            if (xQueueSend(s_pcm_queue, &blk, 0) != pdTRUE) {
-                                free(blk.data);
-                                ESP_LOGW(TAG, "pcm queue full — dropped chunk");
+                    
+                    if (s_ws_buf && s_ws_buf_len + ev->data_len <= WS_REASSEMBLY_SIZE) {
+                        memcpy(s_ws_buf + s_ws_buf_len, ev->data_ptr, ev->data_len);
+                        s_ws_buf_len += ev->data_len;
+                    } else {
+                        ESP_LOGW(TAG, "binary chunk overflow");
+                    }
+
+                    // Push to queue in larger blocks or when the WS frame ends
+                    if (s_ws_buf_len >= 16000 || (ev->payload_offset + ev->data_len >= ev->payload_len)) {
+                        if (s_ws_buf_len > 0) {
+                            pcm_block_t blk;
+                            blk.data = heap_caps_malloc(s_ws_buf_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                            if (blk.data) {
+                                memcpy(blk.data, s_ws_buf, s_ws_buf_len);
+                                blk.len = s_ws_buf_len;
+                                if (xQueueSend(s_pcm_queue, &blk, 0) != pdTRUE) {
+                                    free(blk.data);
+                                    ESP_LOGW(TAG, "pcm queue full — dropped chunk");
+                                }
                             }
+                            s_ws_buf_len = 0;
                         }
                     }
-                } else {
+                }
+            } else {
+                // Control frames (text_delta, done) are reassembled completely
+                if (s_ws_buf && s_ws_buf_len + ev->data_len < WS_REASSEMBLY_SIZE) {
+                    memcpy(s_ws_buf + s_ws_buf_len, ev->data_ptr, ev->data_len);
+                    s_ws_buf_len += ev->data_len;
+                }
+                if (s_ws_buf_len >= (size_t)ev->payload_len && ev->payload_len > 0) {
                     s_ws_buf[s_ws_buf_len] = '\0';
                     handle_ws_message(s_ws_buf, s_ws_buf_len);
+                    s_ws_buf_len = 0;
                 }
-                s_ws_buf_len = 0;
             }
             break;
         case WEBSOCKET_EVENT_ERROR:
@@ -772,6 +790,7 @@ static void ws_connect(const char *uri)
         // still valid; a short read timeout turns that into a false reconnect.
         .reconnect_timeout_ms = 1000,
         .network_timeout_ms   = 20000,
+        .ping_interval_sec    = 10,
         // Verify the server cert against the built-in CA bundle for wss://.
         // Ignored for plain ws:// URIs, so it's safe to always attach.
         .crt_bundle_attach    = esp_crt_bundle_attach,

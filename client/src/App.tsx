@@ -39,10 +39,11 @@ const PRICE_OUTPUT = 0.30;
 type Status = 'idle' | 'thinking' | 'speaking' | 'done' | 'error';
 type ReasoningMode = 'auto' | 'always' | 'never';
 type TtsProvider = 'cartesia' | 'mistral' | 'omnivoice';
-type BackendMode = 'local' | 'runpod';
+type BackendMode = 'railway' | 'local' | 'runpod';
 
 function savedBackendMode(): BackendMode {
-  return localStorage.getItem('buddly_backend') === 'runpod' ? 'runpod' : 'local';
+  const saved = localStorage.getItem('buddly_backend');
+  return saved === 'local' || saved === 'runpod' ? saved : 'railway';
 }
 
 function savedRunpodUrl(): string {
@@ -69,6 +70,7 @@ interface LatencyEntry {
 }
 
 const LOCAL_BASE = 'http://localhost:3001';
+const RAILWAY_BASE = 'https://buddlys-esp-prototyp-production.up.railway.app';
 
 function savedTtsProvider(): TtsProvider {
   const raw = localStorage.getItem('buddly_tts_provider');
@@ -147,7 +149,12 @@ export function App() {
     localStorage.setItem('buddly_runpod_url', v);
   };
 
-  const serverBase = backendMode === 'runpod' && runpodUrl ? runpodUrl : LOCAL_BASE;
+  const serverBase =
+    backendMode === 'railway'
+      ? RAILWAY_BASE
+      : backendMode === 'runpod' && runpodUrl
+        ? runpodUrl
+        : LOCAL_BASE;
   const { ws: wsUrl, stt: sttUrl } = deriveUrls(serverBase);
   const sttUrlRef = useRef(sttUrl);
   sttUrlRef.current = sttUrl;
@@ -561,6 +568,12 @@ export function App() {
             <div className="modal-section">
               <div className="modal-section-title">Server</div>
               <div className="mode-row">
+                <label className={`mode ${backendMode === 'railway' ? 'active' : ''}`}>
+                  <input type="radio" name="backend" checked={backendMode === 'railway'}
+                    onChange={() => setBackendModeAndPersist('railway')} />
+                  <span className="mode-title">Railway</span>
+                  <span className="mode-desc">Production</span>
+                </label>
                 <label className={`mode ${backendMode === 'local' ? 'active' : ''}`}>
                   <input type="radio" name="backend" checked={backendMode === 'local'}
                     onChange={() => setBackendModeAndPersist('local')} />

@@ -11,6 +11,8 @@ IDF_EXPORT="${IDF_EXPORT:-$HOME/esp/esp-idf/export.sh}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
+export PATH="/usr/local/opt/python@3.12/libexec/bin:$PATH"
+
 PORT=""
 DO_MONITOR=0
 while [[ $# -gt 0 ]]; do
@@ -23,7 +25,11 @@ done
 
 # Auto-detect the first usbmodem/usbserial port if none was given.
 if [[ -z "$PORT" ]]; then
-  PORT="$(ls /dev/cu.usbmodem* /dev/cu.usbserial* /dev/cu.wchusbserial* /dev/cu.SLAB_USBtoUART 2>/dev/null | head -n1 || true)"
+  for candidate in /dev/cu.usbmodem* /dev/cu.usbserial* /dev/cu.wchusbserial* /dev/cu.SLAB_USBtoUART; do
+    [[ -e "$candidate" ]] || continue
+    PORT="$candidate"
+    break
+  done
 fi
 if [[ -z "$PORT" ]]; then
   echo "❌ No ESP32 serial port found. Re-seat the USB cable (data cable, not charge-only)." >&2

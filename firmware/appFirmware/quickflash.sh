@@ -1,26 +1,38 @@
 #!/bin/bash
-PYTHON=/Users/kenogollner/.espressif/python_env/idf5.3_py3.13_env/bin/python
-ESPTOOL=/Users/kenogollner/esp/esp-idf/components/esptool_py/esptool/esptool.py
-BUILD=/Users/kenogollner/Buddlys-Mistral-Setup/firmware/esp32-espidf-buddly/buddly_client/build
+set -euo pipefail
 
-echo "Watching for device — unplug and replug the USB-C cable..."
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD="$HERE/build"
 
-BEFORE=$(ls /dev/cu.usb* 2>/dev/null | sort)
-PORT=""
-while [ -z "$PORT" ]; do
-    AFTER=$(ls /dev/cu.usb* 2>/dev/null | sort)
-    NEW=$(comm -13 <(echo "$BEFORE") <(echo "$AFTER") 2>/dev/null | head -1)
-    if [ -n "$NEW" ]; then PORT=$NEW; fi
-    sleep 0.05
-done
+export PATH="/usr/local/opt/python@3.12/libexec/bin:$PATH"
+. "$HOME/esp/esp-idf/export.sh" >/dev/null
+
+if [ ! -f "$BUILD/buddly_client.bin" ]; then
+    echo "No firmware build found at $BUILD. Run idf.py build first."
+    exit 1
+fi
+
+PORT="${1:-}"
+if [ -z "$PORT" ]; then
+    for candidate in /dev/cu.usbmodem* /dev/cu.usbserial* /dev/cu.wchusbserial* /dev/cu.SLAB_USBtoUART; do
+        [ -e "$candidate" ] || continue
+        PORT="$candidate"
+        break
+    done
+fi
+
+if [ -z "$PORT" ]; then
+    echo "No ESP serial port found. Plug in the board and try again."
+    exit 1
+fi
 
 echo "Device found: $PORT"
 echo "Step 1: Erasing flash (fast)..."
-$PYTHON $ESPTOOL --chip esp32s3 -p "$PORT" -b 921600 erase_flash
+python -m esptool --chip esp32s3 -p "$PORT" -b 921600 erase_flash
 
 echo ""
 echo "Step 2: Writing firmware..."
-$PYTHON $ESPTOOL \
+python -m esptool \
   --chip esp32s3 \
   -p "$PORT" \
   -b 921600 \
@@ -28,10 +40,10 @@ $PYTHON $ESPTOOL \
   --after hard_reset \
   write_flash \
   --flash_mode dio \
-  --flash_size 2MB \
+  --flash_size 8MB \
   --flash_freq 80m \
-  0x0     $BUILD/bootloader/bootloader.bin \
-  0x8000  $BUILD/partition_table/partition-table.bin \
-  0x10000 $BUILD/buddly_client.bin
+  0x0     "$BUILD/bootloader/bootloader.bin" \
+  0x8000  "$BUILD/partition_table/partition-table.bin" \
+  0x10000 "$BUILD/buddly_client.bin"
 
 echo "Done!"
