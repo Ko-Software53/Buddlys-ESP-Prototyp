@@ -182,8 +182,20 @@ wss.on('connection', (ws) => {
   // which the device assumes anyway); JSON clients still get it in the frame.
   const emitAudio = (pcm: Buffer, sampleRate: number, encoding: 'pcm_s16le') => {
     if (ws.readyState !== ws.OPEN) return;
-    if (wantsBinaryAudio) { ws.send(pcm); return; }
-    ws.send(JSON.stringify({ type: 'audio_chunk', encoding, sampleRate, audioBase64: pcm.toString('base64') }));
+    const MAX_CHUNK = 4096;
+    for (let offset = 0; offset < pcm.length; offset += MAX_CHUNK) {
+      const chunk = pcm.subarray(offset, offset + MAX_CHUNK);
+      if (wantsBinaryAudio) {
+        ws.send(chunk);
+      } else {
+        ws.send(JSON.stringify({
+          type: 'audio_chunk',
+          encoding,
+          sampleRate,
+          audioBase64: chunk.toString('base64')
+        }));
+      }
+    }
   };
 
   // Per-conversation analytics state
