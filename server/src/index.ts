@@ -82,12 +82,13 @@ type ReasoningMode = 'auto' | 'always' | 'never';
 type TtsProvider = 'cartesia' | 'mistral' | 'omnivoice';
 
 interface TtsSession {
-  send(text: string, isFinal: boolean): void;
+  send(transcript: string, isFinal: boolean): void;
   onChunk(cb: (pcm: Buffer) => void): void;
   done: Promise<void>;
   close(): void;
   sampleRate: number;
   encoding: 'pcm_s16le';
+  isClosed?(): boolean;
 }
 type ClientMsg =
   | { type: 'user_text'; text: string; reasoning?: ReasoningMode; model?: string; tts?: boolean; temperature?: number; ttsProvider?: TtsProvider; device_id?: string }
@@ -150,6 +151,7 @@ wss.on('connection', (ws) => {
   const pingInterval = setInterval(() => {
     if (ws.readyState === ws.OPEN) {
       ws.ping();
+      safeSend(ws, { type: 'ping' });
     }
   }, 5000);
 
@@ -363,7 +365,7 @@ wss.on('connection', (ws) => {
     // LLM fetch can start in parallel. By the time the first sentence is ready
     // (~300 ms+), the WS handshake (~100 ms) is already done.
     const ttsT0 = Date.now();
-    const ttsPromise: Promise<TtsSession | null> = ttsEnabled
+    let ttsPromise: Promise<TtsSession | null> | null = ttsEnabled
       ? (ttsProvider === 'mistral'
           ? openMistralTtsSession()
           : ttsProvider === 'omnivoice'
@@ -380,7 +382,20 @@ wss.on('connection', (ws) => {
 
     // Lazily await TTS and register the chunk callback exactly once.
     const ensureTts = async (): Promise<boolean> => {
-      if (tts) return true;
+      if (tts) {
+        if (tts.isClosed && tts.isClosed()) {
+          console.log('[tts] Session closed (likely timeout), recreating...');
+          tts = null;
+          ttsPromise = (ttsProvider === 'mistral'
+              ? openMistralTtsSession()
+              : ttsProvider === 'omnivoice'
+              ? openOmniVoiceSession()
+              : openCartesiaSession()
+            ).catch(() => null);
+        } else {
+          return true;
+        }
+      }
       tts = await ttsPromise;
       if (!tts) return false;
       tts.onChunk((pcm) => {

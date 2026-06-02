@@ -39,6 +39,8 @@ export interface CartesiaSession {
   close(): void;
   sampleRate: number;
   encoding: typeof PCM_ENCODING;
+  /** Gibt zurück, ob die Verbindung geschlossen wurde. */
+  isClosed(): boolean;
 }
 
 export interface CartesiaSessionOptions {
@@ -149,5 +151,6 @@ export async function openCartesiaSession(
     },
     done,
     close: () => finish(),
+    isClosed: () => ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING,
   };
 }
