@@ -48,10 +48,11 @@ const SYSTEM_PROMPT = [
 
   // Tools — Verhalten ist strikt
   'Du hast vier Werkzeuge: calculator, web_search, current_time, reason_deeply.',
-  'Vor einem Tool-Call sagst du EINEN ganz kurzen Übergangssatz (max. 5 Wörter), ' +
-  'der natürlich zum Thema passt — wie ein Mensch, der kurz innehält und nachdenkt. ' +
-  'Beispiele: "Oh, das schau ich mal nach.", "Hmm, das rechne ich kurz.", "Lass mich überlegen.", ' +
-  '"Moment, ich schaue." Dann kommt der Tool-Call. ' +
+  'Wenn du ein Werkzeug brauchst, rufe es SOFORT auf — als ALLERERSTES, ' +
+  'OHNE vorher irgendeinen Satz zu sagen. Sag NICHT "ich schau mal nach" oder ' +
+  '"Moment" und höre dann auf — das System spielt automatisch einen kurzen ' +
+  'Überbrückungs-Ton ab, während das Werkzeug läuft. Schreibe also KEINEN ' +
+  'Übergangssatz, sondern starte direkt mit dem Tool-Call. ' +
   'NACH dem Tool-Result formulierst du die finale Antwort, ' +
   'OHNE das Tool-Resultat wörtlich zu zitieren.',
 

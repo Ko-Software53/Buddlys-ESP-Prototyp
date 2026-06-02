@@ -391,8 +391,13 @@ static void playback_task(void *arg)
     bool playing = false;
     size_t rebuf_target = 0;
     esp_codec_dev_handle_t play = get_playback_handle();
-    int16_t stereo[MIC_SAMPLE_RATE * 30 / 1000 * 2];
-    int16_t mono_tmp[MIC_SAMPLE_RATE * 30 / 1000];
+    // These two buffers (~2.8 KB total) MUST be static, not on the task stack:
+    // playback_task is a singleton, and during a jitter-buffer underrun the
+    // esp_codec_dev_write/I2S call chain needs the stack headroom. With them on a
+    // 4 KB stack the underrun path overflowed → "Core 1 Double exception" crash +
+    // reboot (seen exactly during web-search gaps). static moves them to .bss.
+    static int16_t stereo[MIC_SAMPLE_RATE * 30 / 1000 * 2];
+    static int16_t mono_tmp[MIC_SAMPLE_RATE * 30 / 1000];
 
     while (1) {
         if (s_drain_jbuf) {
@@ -1145,7 +1150,7 @@ void app_main(void)
 
     buttons_init();
     xTaskCreate(led_task, "led", 2048, NULL, 3, NULL);
-    xTaskCreatePinnedToCore(playback_task, "playback", 4096, NULL, 18, NULL, 1);
+    xTaskCreatePinnedToCore(playback_task, "playback", 6144, NULL, 18, NULL, 1);
     // Pinned to CPU0 (same core as the capture loop) so the producer/consumer
     // index ordering on s_rec_buf holds without explicit memory barriers.
     xTaskCreatePinnedToCore(audio_sender_task, "audio_tx", 4096, NULL, 6, NULL, 0);
