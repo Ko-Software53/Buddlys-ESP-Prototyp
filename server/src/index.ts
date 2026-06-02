@@ -170,7 +170,7 @@ wss.on('connection', (ws) => {
       ws.ping();
       safeSend(ws, { type: 'ping' });
     }
-  }, 5000);
+  }, 2000);
 
   const session = new ConversationSession();
   const sessionStart = Date.now();

@@ -60,3 +60,6 @@ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=256
 # SW coexistence: BLE + WiFi share the radio gracefully
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+# Disable AMPDU RX to prevent RX DELBA and RX path wedging on some APs
+CONFIG_WIFI_AMPDU_RX_ENABLED=n

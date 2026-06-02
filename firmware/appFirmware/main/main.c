@@ -566,7 +566,7 @@ static void send_config(void)
     char *msg = NULL;
     asprintf(&msg,
         "{\"type\":\"config\",\"device_id\":\"%s\",\"model\":\"%s\","
-        "\"reasoning\":\"%s\",\"tts\":true,\"ttsProvider\":\"%s\",\"audioBinary\":false}",
+        "\"reasoning\":\"%s\",\"tts\":true,\"ttsProvider\":\"%s\",\"audioBinary\":true}",
         ble_prov_device_id(), BUDDLY_MODEL, BUDDLY_REASONING, BUDDLY_TTS_PROVIDER);
     if (!msg) return;
 
@@ -675,7 +675,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base,
             s_streaming = false; s_stream_end = false; s_stream_cancel = false;
             break;
         case WEBSOCKET_EVENT_DATA:
-            if (ev->op_code == 0x8) break;   // close frame
+            if (ev->op_code == 0x8 || ev->op_code == 0x9 || ev->op_code == 0xa) break;   // close/ping/pong frames
             // Reassemble the (possibly fragmented) frame into s_ws_buf, then
             // dispatch by type. Audio now arrives as BINARY frames (op_code 0x2)
             // carrying raw PCM (16 kHz mono s16le) with NO base64/JSON wrapper —
