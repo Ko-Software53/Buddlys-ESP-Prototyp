@@ -81,7 +81,7 @@ async function loadSfxFiles(): Promise<CachedFiller[]> {
       const buf = await fs.readFile(path.join(dir, name));
       const pcm = parseWavToPcm(buf);
       if (pcm) {
-        out.push({ text: `[sfx:${name}]`, pcm });
+        out.push({ text: `[sfx:${name}]`, pcm: padToMinimumDuration(pcm) });
         console.log(`[filler] SFX geladen: ${name} (${pcm.length} bytes PCM)`);
       } else {
         console.warn(`[filler] SFX übersprungen (Format != 24kHz/16-bit/mono): ${name}`);
@@ -124,6 +124,15 @@ function parseWavToPcm(buf: Buffer): Buffer | null {
   return buf.subarray(dataStart, dataStart + dataLen);
 }
 
+// Pad fillers to at least 1600ms so they bypass the ESP32's JITTER_PREBUF_MS (1500ms)
+// and start playing instantly without waiting for the rest of the answer.
+function padToMinimumDuration(pcm: Buffer, minMs: number = 1600): Buffer {
+  const minBytes = Math.ceil((PCM_SAMPLE_RATE * minMs) / 1000) * 2;
+  if (pcm.length >= minBytes) return pcm;
+  const padding = Buffer.alloc(minBytes - pcm.length, 0);
+  return Buffer.concat([pcm, padding]);
+}
+
 export async function preloadFillers(): Promise<void> {
   if (loaded) return;
   loaded = true;
@@ -147,7 +156,7 @@ export async function preloadFillers(): Promise<void> {
       try {
         const pcm = await renderOne(text);
         if (pcm.length > 0) {
-          results.push({ text, pcm });
+          results.push({ text, pcm: padToMinimumDuration(pcm) });
           okCount++;
         }
       } catch (err) {
@@ -157,7 +166,7 @@ export async function preloadFillers(): Promise<void> {
         try {
           const pcm = await renderOne(text);
           if (pcm.length > 0) {
-            results.push({ text, pcm });
+            results.push({ text, pcm: padToMinimumDuration(pcm) });
             okCount++;
             failCount--;
           }
@@ -180,6 +189,19 @@ export async function preloadFillers(): Promise<void> {
 export function pickFiller(): { pcm: Buffer; text: string; sampleRate: number; encoding: typeof PCM_ENCODING } | null {
   if (!cache.length) return null;
   const item = cache[Math.floor(Math.random() * cache.length)];
+  return {
+    pcm: item.pcm,
+    text: item.text.startsWith('[sfx:') ? '' : item.text,
+    sampleRate: PCM_SAMPLE_RATE,
+    encoding: PCM_ENCODING,
+  };
+}
+
+export function pickShortFiller(): { pcm: Buffer; text: string; sampleRate: number; encoding: typeof PCM_ENCODING } | null {
+  if (!cache.length) return null;
+  const shortFillers = cache.filter(c => c.text.length < 15 || c.text.includes('Hmm') || c.text.includes('Mhm'));
+  const pool = shortFillers.length ? shortFillers : cache;
+  const item = pool[Math.floor(Math.random() * pool.length)];
   return {
     pcm: item.pcm,
     text: item.text.startsWith('[sfx:') ? '' : item.text,
