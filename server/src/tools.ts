@@ -1,6 +1,8 @@
 import { evaluate } from 'mathjs';
 import { webSearch } from './webSearch.js';
 import { reasonDeeply } from './reasoning.js';
+import { searchGlobalKnowledge } from './rag.js';
+
 
 /**
  * Tool-Definitionen + Dispatcher.
@@ -39,6 +41,27 @@ export const TOOL_DEFS: MistralToolDef[] = [
           },
         },
         required: ['expression'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_encyclopedia',
+      description:
+        'Durchsucht die Buddly-Wissensdatenbank (Enzyklopädie) nach verlässlichen Fakten. ' +
+        'Nutze dies IMMER, wenn das Kind nach Erklärungen zu Dingen (Tiere, Weltall, Natur, ' +
+        'Geschichte, Technik usw.) fragt. Du DARFST NIEMALS dein eigenes Wissen für Fakten ' +
+        'verwenden. Erfinde nichts dazu!',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'Der Suchbegriff oder die Frage (z.B. "Wie schlafen Haie?").',
+          },
+        },
+        required: ['query'],
       },
     },
   },
@@ -131,6 +154,9 @@ export async function dispatchTool(call: ToolCall): Promise<ToolResult> {
         break;
       case 'web_search':
         content = await webSearch(String(args.query ?? ''));
+        break;
+      case 'query_encyclopedia':
+        content = await searchGlobalKnowledge(String(args.query ?? ''));
         break;
       case 'current_time':
         content = doNow();
