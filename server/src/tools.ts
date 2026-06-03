@@ -157,6 +157,10 @@ export async function dispatchTool(call: ToolCall): Promise<ToolResult> {
         break;
       case 'query_encyclopedia':
         content = await searchGlobalKnowledge(String(args.query ?? ''));
+        if (content === 'Keine relevanten Informationen in der Wissensdatenbank gefunden.') {
+          const fallbackContent = await webSearch(String(args.query ?? ''));
+          content = `(Keine Treffer in der Enzyklopädie gefunden. Dies sind automatische Fallback-Ergebnisse aus der Websuche:)\n\n${fallbackContent}`;
+        }
         break;
       case 'current_time':
         content = doNow();
