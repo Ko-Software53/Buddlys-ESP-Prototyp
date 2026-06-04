@@ -11,6 +11,7 @@ idf_component_register(
         "audio/clip_reconnect.pcm"
     REQUIRES
         codec_board
+        libfvad
         esp_wifi
         esp_event
         esp_netif

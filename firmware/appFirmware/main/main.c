@@ -20,6 +20,7 @@
 #include "mbedtls/base64.h"
 #include "esp_crt_bundle.h"
 #include "cJSON.h"
+#include "fvad.h"
 #include "settings.h"
 #include "nvs_config.h"
 #include "ble_prov.h"
@@ -93,6 +94,11 @@ static size_t   s_preroll_head     = 0;
 static bool     s_preroll_full     = false;
 static bool     s_vad_in_speech    = false;
 static uint32_t s_silence_since_ms = 0;
+// libfvad voice-activity detector: classifies each 20 ms mic frame as speech vs.
+// non-speech from its spectral shape (not loudness), replacing the old RMS gate.
+static Fvad    *s_fvad             = NULL;
+static uint16_t s_onset_frames     = 0;  // consecutive speech frames seen while idle
+static uint16_t s_vad_speech_frames = 0; // speech frames captured in the current turn
 
 // Runtime server config (filled from NVS or settings.h defaults)
 static char     s_srv_host[128] = SERVER_HOST;
@@ -517,9 +523,10 @@ static void audio_sender_task(void *arg)
         }
 
         // Do NOT transmit while the mic is still live: continuous WiFi TX couples
-        // noise into the high-gain ES7210 ADC, lifting the RMS above
-        // VAD_CONTINUE_THRESHOLD so end-of-speech never fires (the turn ran to the
-        // 15 s cap). The TCP-window fix makes the post-speech upload fast enough
+        // noise into the high-gain ES7210 ADC, which can disturb the VAD's
+        // end-of-speech decision (historically lifted the old RMS gate so a turn
+        // never ended and ran to the buffer cap). The TCP-window fix makes the
+        // post-speech upload fast enough
         // (~200 ms for a normal turn) that we don't need to overlap it with speech,
         // so we hold all chunks until capture finishes (s_stream_end), then burst.
         if (!s_stream_end) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
@@ -979,8 +986,15 @@ static void stop_and_send(void)
     // (frozen now that s_recording is false) until drained. Don't reset
     // s_rec_samples here — the next start_recording/onset does that, after the
     // half-duplex playback gate guarantees this stream has long since finished.
-    if (peak < 50 || s_rec_samples < (size_t)(MIC_SAMPLE_RATE / 2)) {
-        ESP_LOGW(TAG, "%s", peak < 50 ? "Mic silent — cancel" : "Too short — cancel");
+    // In VAD mode also drop turns that contained almost no fvad-confirmed speech:
+    // a brief false trigger (a noise burst that flickered "speech" at onset) records
+    // mostly silence and would otherwise be uploaded, where the STT hallucinates a
+    // canned phrase. Real utterances accumulate well over VAD_MIN_SPEECH_FRAMES.
+    bool too_little_speech = s_talk_mode == 1 && s_vad_speech_frames < VAD_MIN_SPEECH_FRAMES;
+    if (peak < 50 || s_rec_samples < (size_t)(MIC_SAMPLE_RATE / 2) || too_little_speech) {
+        ESP_LOGW(TAG, "Cancel (%s, speech_frames=%d)",
+                 too_little_speech ? "too little speech" : (peak < 50 ? "mic silent" : "too short"),
+                 s_vad_speech_frames);
         s_stream_cancel = true;   // sender drops buffered chunks
         return;
     }
@@ -997,6 +1011,14 @@ static void vad_init(void)
                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_preroll_buf) s_preroll_buf = malloc(VAD_PREROLL_FRAMES * sizeof(int16_t));
     if (!s_preroll_buf) ESP_LOGE(TAG, "Cannot allocate VAD preroll buffer!");
+
+    s_fvad = fvad_new();
+    if (!s_fvad) {
+        ESP_LOGE(TAG, "Cannot allocate fvad VAD instance!");
+    } else {
+        fvad_set_sample_rate(s_fvad, MIC_SAMPLE_RATE);  // 16 kHz mic frames
+        fvad_set_mode(s_fvad, VAD_FVAD_MODE);           // 0=quality … 3=most noise-rejecting
+    }
 }
 
 static int16_t chunk_rms(const int16_t *buf, size_t n)
@@ -1014,13 +1036,25 @@ static void vad_capture_chunk(void)
     int16_t stereo[frames * MIC_CHANNELS];
     if (esp_codec_dev_read(rec, stereo, sizeof(stereo)) != 0) return;
 
-    int16_t mono[frames];
+    int16_t mono[frames];     // full mic gain → recording buffer (STT needs it loud)
+    int16_t vad_in[frames];   // pre-software-gain → fvad (see below)
     for (size_t i = 0; i < frames; i++) {
         int32_t mixed = ((int32_t)stereo[i * 2] + stereo[i * 2 + 1]) / 2;
-        mono[i] = mic_gain((int16_t)mixed);
+        vad_in[i] = (int16_t)mixed;            // post-HW-gain only: cannot clip (avg of two int16)
+        mono[i]   = mic_gain((int16_t)mixed);  // + MIC_SW_GAIN, clamped, for the recording
     }
 
-    int16_t energy = chunk_rms(mono, frames);
+    // Voice activity decision for this 20 ms frame: 1 = speech, 0 = non-speech,
+    // -1 = bad frame length. libfvad classifies the signal's spectral SHAPE, so
+    // steady background noise (fan/TV bed) reads as non-speech and a child's voice
+    // reads as speech at the same loudness — something a raw RMS gate cannot do.
+    //
+    // IMPORTANT: feed fvad the PRE-software-gain signal. The recording path applies
+    // MIC_SW_GAIN (×4) on top of 30 dB of ADC gain and CLAMPS, so on the amplified
+    // ambient noise floor (RMS ~200–350 even in a quiet room) it clips into
+    // square-ish, broadband, harmonic-rich waveforms — which fvad reads as a voiced
+    // human sound and so reports "speech" nonstop. The un-clipped vad_in avoids that.
+    int speech = s_fvad ? fvad_process(s_fvad, vad_in, frames) : -1;
 
     if (!s_vad_in_speech) {
         for (size_t i = 0; i < frames; i++) {
@@ -1029,21 +1063,42 @@ static void vad_capture_chunk(void)
             if (s_preroll_head == 0) s_preroll_full = true;
         }
 
+        // Diagnostic: show fvad's idle decision once a second so a room that keeps
+        // triggering reveals whether fvad mis-fires (speech=1 in silence) and at
+        // what input level (rms is the pre-software-gain signal fvad actually sees).
+        static uint32_t s_last_idle_log_ms = 0;
+        if (now_ms() - s_last_idle_log_ms >= 1000) {
+            s_last_idle_log_ms = now_ms();
+            ESP_LOGI(TAG, "VAD: idle speech=%d rms=%d", speech, chunk_rms(vad_in, frames));
+        }
+
+        // Require a few consecutive speech frames before opening a turn so a single
+        // false-positive frame can't trigger a spurious upload. The preroll ring
+        // backfills the ~VAD_PREROLL_MS before onset, so these confirm frames are
+        // not lost from the recording.
+        if (speech == 1) {
+            if (s_onset_frames < 0xffff) s_onset_frames++;
+        } else {
+            s_onset_frames = 0;
+        }
+
         bool playing_back = s_stream_active || (now_ms() - s_last_speaking_ms) < VAD_SUPPRESS_MS;
         // Don't open a new utterance until the previous one has finished
         // uploading (audio_start..audio_end), so the two streams can't interleave.
-        if (energy >= VAD_SPEECH_THRESHOLD && !s_streaming) {
+        if (s_onset_frames >= VAD_ONSET_SPEECH_FRAMES && !s_streaming) {
             if (playing_back) {
                 s_drain_jbuf       = true;
                 s_last_speaking_ms = 0;
-                ESP_LOGI(TAG, "VAD: interrupt (rms=%d)", energy);
+                ESP_LOGI(TAG, "VAD: interrupt (speech)");
             } else {
-                ESP_LOGI(TAG, "VAD: speech onset (rms=%d)", energy);
+                ESP_LOGI(TAG, "VAD: speech onset");
             }
-            s_rec_samples      = 0;
-            s_vad_in_speech    = true;
-            s_silence_since_ms = 0;
-            s_recording        = true;
+            s_rec_samples       = 0;
+            s_vad_in_speech     = true;
+            s_silence_since_ms  = 0;
+            s_onset_frames      = 0;
+            s_vad_speech_frames = 0;
+            s_recording         = true;
             stream_begin();   // audio_start + arm the sender (s_rec_samples is 0 here)
 
             size_t preroll_count = s_preroll_full ? VAD_PREROLL_FRAMES : s_preroll_head;
@@ -1065,32 +1120,36 @@ static void vad_capture_chunk(void)
             s_vad_in_speech  = false;
             s_preroll_head   = 0;
             s_preroll_full   = false;
+            s_onset_frames   = 0;
             stop_and_send();
             return;
         }
 
-        // Keep the turn alive only while we still hear speech-level energy.
-        // Anything below VAD_CONTINUE_THRESHOLD (room noise, trailing breath)
-        // counts toward silence, so the mic releases ~VAD_SILENCE_MS after the
-        // child actually stops talking instead of being held open by ambient noise.
-        // Diagnostic: surface the live RMS once a second while in speech, so a
-        // turn that won't end reveals whether the noise floor sits above
-        // VAD_CONTINUE_THRESHOLD (e.g. WiFi-TX coupling) vs. real continuous sound.
-        static uint32_t s_last_rms_log_ms = 0;
-        if (now_ms() - s_last_rms_log_ms >= 1000) {
-            s_last_rms_log_ms = now_ms();
-            ESP_LOGI(TAG, "VAD: in-speech rms=%d (continue>=%d)", energy, VAD_CONTINUE_THRESHOLD);
+        // Diagnostic: surface the live speech decision once a second while in speech,
+        // so a turn that won't end (or one that cuts off early) is visible on the
+        // monitor alongside the raw RMS for context.
+        static uint32_t s_last_vad_log_ms = 0;
+        if (now_ms() - s_last_vad_log_ms >= 1000) {
+            s_last_vad_log_ms = now_ms();
+            ESP_LOGI(TAG, "VAD: in-speech speech=%d rms=%d", speech, chunk_rms(vad_in, frames));
         }
 
-        if (energy >= VAD_CONTINUE_THRESHOLD) {
+        // End the turn once we've heard VAD_SILENCE_MS of continuous non-speech.
+        // A real pause or filler ("ähm") is voiced (speech==1) so it keeps the turn
+        // alive; only genuine inter-word silence counts down. Because the model —
+        // not loudness — makes the call, the hangover can be short without ambient
+        // noise resetting it.
+        if (speech == 1) {
             s_silence_since_ms = 0;
+            if (s_vad_speech_frames < 0xffff) s_vad_speech_frames++;
         } else if (s_silence_since_ms == 0) {
             s_silence_since_ms = now_ms();
         } else if (now_ms() - s_silence_since_ms >= VAD_SILENCE_MS) {
-            ESP_LOGI(TAG, "VAD: end of speech (rms=%d)", energy);
+            ESP_LOGI(TAG, "VAD: end of speech");
             s_vad_in_speech  = false;
             s_preroll_head   = 0;
             s_preroll_full   = false;
+            s_onset_frames   = 0;
             stop_and_send();
         }
     }
@@ -1235,7 +1294,6 @@ void app_main(void)
     bool last_pressed = false;
     bool prev_ws_connected   = false;
     uint32_t rssi_ok_since   = 0;
-    uint32_t ws_conn_since   = 0;
 
     while (1) {
         handle_power_button();
@@ -1260,7 +1318,6 @@ void app_main(void)
         // deep-sleep wake — the root cause of the dropped-connection + stutter.
         // Track WS connection edges to drive spoken feedback.
         if (s_ws_connected && !prev_ws_connected) {
-            ws_conn_since = now_ms();
             rssi_ok_since = 0;
         } else if (!s_ws_connected && prev_ws_connected && s_app_ready) {
             // Lost the link mid-session → pause turns and reassure the child.
@@ -1280,11 +1337,13 @@ void app_main(void)
                 } else {
                     rssi_ok_since = 0;
                 }
+                // Only announce "ready" once the link is actually solid: RSSI
+                // held at/above WIFI_READY_RSSI_DBM for WIFI_READY_SETTLE_MS.
+                // No timeout fallback — a weak link must genuinely settle first,
+                // so the toy never tells the child it's ready when it isn't.
                 bool settled = rssi_ok_since && now_ms() - rssi_ok_since >= WIFI_READY_SETTLE_MS;
-                bool capped  = now_ms() - ws_conn_since >= WIFI_READY_MAX_WAIT_MS;
-                if (settled || capped) {
-                    ESP_LOGI(TAG, "Warm-up done (rssi=%d settled=%d capped=%d) — ready",
-                             rssi, settled, capped);
+                if (settled) {
+                    ESP_LOGI(TAG, "Warm-up done (rssi=%d) — ready", rssi);
                     play_clip(clip_ready_start, clip_ready_end);
                     s_app_ready = true;
                 }
@@ -1314,6 +1373,7 @@ void app_main(void)
             if (s_streaming)   s_stream_cancel = true;  // abort any in-progress upload
             s_vad_in_speech    = false;
             s_silence_since_ms = 0;
+            s_onset_frames     = 0;
             last_pressed       = false;
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;

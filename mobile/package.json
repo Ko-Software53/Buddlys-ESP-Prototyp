@@ -6,6 +6,7 @@
     "start": "expo start --dev-client",
     "android": "expo run:android",
     "ios": "expo run:ios",
+    "ios:device": "bash scripts/install-ios-release.sh",
     "prebuild": "expo prebuild"
   },
   "dependencies": {
@@ -21,7 +22,7 @@
     "expo-linking": "~8.0.12",
     "expo-router": "~6.0.23",
     "expo-status-bar": "~3.0.9",
-    "react": "^19.1.0",
+    "react": "19.1.0",
     "react-native": "^0.81.5",
     "react-native-ble-plx": "^3.2.0",
     "react-native-safe-area-context": "~5.6.0",

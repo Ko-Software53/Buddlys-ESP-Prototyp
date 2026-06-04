@@ -34,6 +34,36 @@ import { getDeviceConfig, touchDevice, updateDeviceBattery, createConversation, 
 
 const PORT = Number(process.env.PORT) || 3001;
 
+// Voxtral/Whisper-family STT emits canned "hallucination" phrases when handed
+// noise or near-silence (a stray VAD trigger). Drop those so the toy doesn't
+// answer a question the child never asked. Kept deliberately conservative — only
+// the well-known noise outputs and pure-punctuation results — so real short
+// answers ("Ja", "Nein") still get through. Match is on the lowercased transcript.
+const STT_NOISE_PHRASES = [
+  'vielen dank',
+  'vielen dank fürs zuschauen',
+  'vielen dank für ihre aufmerksamkeit',
+  'untertitel',
+  'untertitelung',
+  'amara.org',
+  'das war es',
+  "das war's",
+  'bis zum nächsten mal',
+  'bis zum nächsten video',
+  'thank you',
+  'thanks for watching',
+  'thank you for watching',
+  'please subscribe',
+];
+
+function isLikelySttNoise(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  // Pure punctuation / single stray character ("." "..." "!?") → no real content.
+  const alnum = t.replace(/[^a-z0-9äöüß]/gi, '');
+  if (alnum.length < 2) return true;
+  return STT_NOISE_PHRASES.some((p) => t === p || t.includes(p));
+}
+
 const app = express();
 
 // CORS für Browser-Client auf 5173 → 3001
@@ -557,7 +587,11 @@ wss.on('connection', (ws) => {
       return;
     }
     console.log(`[stt-ws] ${Date.now() - t0}ms  "${text}"`);
-    if (!text.trim()) { safeSend(ws, { type: 'done' }); return; }
+    if (!text.trim() || isLikelySttNoise(text)) {
+      if (text.trim()) console.log(`[stt-ws] dropped as noise/hallucination: "${text}"`);
+      safeSend(ws, { type: 'done' });
+      return;
+    }
     await handleTurn({ text, ...turnCfg });
   };
 

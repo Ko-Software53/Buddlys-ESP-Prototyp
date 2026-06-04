@@ -56,20 +56,16 @@
 // the link is genuinely solid, and plays a spoken status clip in the meantime.
 #define WARMUP_AUDIO_FEEDBACK   1     // 1 = play embedded voice clips on connect/reconnect
 #define WIFI_READY_RSSI_DBM     (-78) // link counts as solid at/above this RSSI (dBm; closer to 0 = stronger)
-#define WIFI_READY_SETTLE_MS    800   // RSSI must stay solid this long before the toy goes "ready"
-#define WIFI_READY_MAX_WAIT_MS  4000  // hard cap: go ready anyway this long after WS connects (weak-but-working link)
+#define WIFI_READY_SETTLE_MS    800   // RSSI must stay solid this long before the toy goes "ready" (no timeout fallback — link must genuinely settle)
 
-// VAD settings — thresholds are in post-software-gain RMS units
-#define VAD_SPEECH_THRESHOLD    800   // RMS to trigger speech onset (lower = wakes on quieter speech)
-#define VAD_CONTINUE_THRESHOLD  500   // RMS to keep an active turn alive; below this counts toward end-of-turn silence.
-                                      // MEASURED 2026-05-31: with the high mic gain (30dB+4x) the ambient NOISE FLOOR reads
-                                      // ~200–350 RMS, so the old 300 let noise keep resetting the silence timer → turns never
-                                      // ended → ran to the 15s buffer cap and uploaded huge recordings. Real continued speech
-                                      // sits well above 500 (onset gate is 800); 500 lets the ~350 noise floor count as silence
-                                      // so end-of-speech actually fires. If a noisy room still won't end turns, raise toward 600.
-#define VAD_SILENCE_MS          900   // ms below the continue threshold before the turn ends (higher = tolerates mid-sentence pauses like "uhm").
-                                      // This is pure dead time after the child stops talking, ON the critical path before STT even starts —
-                                      // every ms here is felt as latency. 900 tolerates thinking pauses and filler words ("um"); drop toward 600 if latency bothers.
+// VAD settings — speech vs. non-speech is now decided by libfvad (a model that
+// looks at the signal's spectral shape), NOT a raw RMS energy threshold. Energy
+// thresholds couldn't separate steady room noise from a child's voice at the same
+// loudness, so a noisy room held turns open to the buffer cap. See vad_capture_chunk.
+#define VAD_FVAD_MODE           3     // libfvad aggressiveness: 0=quality … 3=most noise-rejecting. Higher = fewer false "speech" frames in noise. 3 chosen because this mic runs very high gain (30 dB + ×4) and the amplified noise floor is easily mistaken for speech; drop toward 1–2 only if quiet speech gets missed.
+#define VAD_ONSET_SPEECH_FRAMES 3     // consecutive 20 ms speech frames (×20 ms) required to OPEN a turn, so one stray frame can't trigger a spurious upload. 3 = ~60 ms. The preroll backfills audio before onset so nothing is lost.
+#define VAD_MIN_SPEECH_FRAMES   8     // a turn must contain at least this many speech frames (×20 ms) total or it's dropped without uploading — kills brief false triggers that the STT would otherwise hallucinate a reply to. 8 = ~160 ms. Lower if very short answers ("Ja") get dropped; raise to be stricter about noise.
+#define VAD_SILENCE_MS          300   // ms of continuous NON-speech before the turn ends. Pure dead time on the critical path before STT, so it's felt directly as latency. A real pause/"ähm" is voiced so it keeps the turn alive — only true silence counts down — so this can be short. Raise toward 500 if kids get cut off mid-thought; lower toward 200 for snappier replies.
 #define VAD_PREROLL_MS          200   // ms of audio captured before onset
 #define VAD_SUPPRESS_MS         700   // echo-tail guard after last playback sample before the mic re-engages (half-duplex)
 

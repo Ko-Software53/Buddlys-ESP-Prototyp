@@ -29,6 +29,15 @@ function intToGerman(n: number): string {
   return String(n);
 }
 
+/** Liest eine vierstellige Zahl in "Hunderter"-Form: 1945 → "neunzehnhundertfünfundvierzig".
+ *  Im Deutschen die übliche Lesart für Jahreszahlen (und umgangssprachlich für Mengen)
+ *  von 1100–1999. Ab 2000 ist die Kardinalform bereits korrekt ("zweitausendvierundzwanzig"). */
+function germanHundredsForm(n: number): string {
+  const hi = Math.floor(n / 100); // 11..19
+  const lo = n % 100;
+  return intToGerman(hi) + 'hundert' + (lo === 0 ? '' : intToGerman(lo));
+}
+
 /** Ersetzt Zahlen im Text durch ausgeschriebene deutsche Wörter, damit TTS-Engines
  *  keine Digit-Strings falsch vorlesen. Wird auf jeden TTS-Chunk angewendet. */
 export function spellOutNumbers(text: string): string {
@@ -56,7 +65,12 @@ export function spellOutNumbers(text: string): string {
     } else {
       const n = parseInt(absStr, 10);
       if (isNaN(n) || n >= 1_000_000_000) return match;
-      word = intToGerman(n);
+      // Reine vierstellige Zahlen 1100–1999 als Jahreszahl lesen
+      // (1945 → "neunzehnhundertfünfundvierzig" statt "...eintausend..."). 2000+
+      // bleibt Kardinalform, die als Jahr ohnehin korrekt klingt.
+      word = absStr.length === 4 && n >= 1100 && n <= 1999
+        ? germanHundredsForm(n)
+        : intToGerman(n);
     }
 
     if (isNeg) word = 'minus ' + word;

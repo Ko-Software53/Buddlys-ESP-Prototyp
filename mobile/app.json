@@ -53,6 +53,7 @@
     "experiments": {
       "typedRoutes": true
     },
+    "newArchEnabled": false,
     "extra": {
       "serverHost": "buddlys-esp-prototyp-production.up.railway.app",
       "serverPort": 443
