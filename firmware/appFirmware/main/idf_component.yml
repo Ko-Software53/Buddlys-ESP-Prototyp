@@ -1,3 +1,7 @@
 dependencies:
   idf: ">=5.3"
   espressif/esp_websocket_client: "^1.2.0"
+  # Audio Front-End (AEC/NS/VAD). Used for barge-in: gives an echo-cancelled mic
+  # stream so the child can interrupt Buddly while it's speaking. Configured as
+  # AFE_TYPE_VC with WebRTC AEC/NS/VAD (no neural models needed) — see afe_frontend.c.
+  espressif/esp-sr: "^2.0.0"

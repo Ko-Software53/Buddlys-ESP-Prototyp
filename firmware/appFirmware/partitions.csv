@@ -1,4 +1,9 @@
 # Name,   Type, SubType, Offset,   Size,  Flags
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
-factory,  app,  factory, 0x10000,  0x200000,
+# App grown 2MB -> 3MB to fit the esp-sr AFE (AEC/NS/VAD) library used for barge-in.
+factory,  app,  factory, 0x10000,  0x300000,
+# esp-sr model image partition. We use WebRTC AEC/NS/VAD (no neural models), so
+# this stays effectively empty, but esp-sr's build/flash expects a `model`
+# spiffs partition to exist. 8MB flash leaves plenty of room.
+model,    data, spiffs,  ,         0x100000,

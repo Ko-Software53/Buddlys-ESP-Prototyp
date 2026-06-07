@@ -34,9 +34,27 @@
 #define LED_ACTIVE_LOW      1
 
 #define MIC_SAMPLE_RATE     16000
-#define MIC_CHANNELS        2        // MIC1+MIC2 as L+R; we mix to mono
+#define MIC_CHANNELS        2        // legacy: MIC1+MIC2 as L+R (pre-AEC mix path)
 #define MIC_BITS            16
 #define MAX_RECORD_SECONDS  15
+
+// ─── AEC / barge-in (esp-sr AFE) ─────────────────────────────────────────────
+// The ES7210 is read in 4-slot TDM (codec_board already configures all 4 mics).
+// Those 4 slots carry the two real mics PLUS the speaker echo-reference that the
+// AFE needs for acoustic echo cancellation. We feed all 4 to esp-sr's AFE and
+// consume its echo-cancelled MONO output, so the child's voice can be detected
+// (libfvad) even while Buddly is talking → barge-in.
+#define MIC_TDM_CHANNELS    4
+// How the 4 interleaved TDM slots map to AFE channel roles:
+//   M = microphone, R = playback echo-reference, N = unused/null.
+// This MUST match the board's real slot order. "RMNM" matches the ES8311+ES7210
+// korvo-2-class layout (slot0=reference, slot1=mic, slot2=null, slot3=mic).
+// VERIFY ON DEVICE: dump the 4 slots while a clip plays and confirm which slot
+// carries the speaker signal; adjust this string if the reference isn't slot 0.
+#define BUDDLY_AFE_INPUT_FORMAT "RMNM"
+// Master switch for voice barge-in. 1 = mic stays live during playback (AEC) and
+// the child can interrupt; 0 = classic strict half-duplex (mic muted while talking).
+#define BUDDLY_BARGE_IN     1
 
 #define SPK_SAMPLE_RATE     16000
 #define SPK_CHANNELS        2

@@ -63,3 +63,14 @@ CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 
 # Disable AMPDU RX to prevent RX DELBA and RX path wedging on some APs
 CONFIG_WIFI_AMPDU_RX_ENABLED=n
+
+# ── esp-sr Audio Front-End (barge-in / AEC) ──────────────────────────────────
+# We run the AFE as AFE_TYPE_VC to get an echo-cancelled mic stream so the child
+# can interrupt Buddly mid-reply. Use the ALGORITHMIC WebRTC AEC/NS/VAD (no neural
+# models, no model partition payload, far less RAM/flash than the NN variants).
+# All wake words stay disabled — barge-in detects speech via libfvad on the
+# cleaned stream, not a keyword.
+CONFIG_AFE_INTERFACE_V1=y
+CONFIG_SR_NSN_WEBRTC=y
+CONFIG_SR_VADN_WEBRTC=y
+# Custom partition table already declares the `model` spiffs partition esp-sr expects.

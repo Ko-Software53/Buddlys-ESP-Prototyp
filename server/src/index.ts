@@ -144,6 +144,7 @@ type ClientMsg =
   | { type: 'audio_start' }
   | { type: 'audio_end' }
   | { type: 'audio_cancel' }
+  | { type: 'cancel' }
   | { type: 'reset' };
 
 function safeSend(ws: WebSocket, payload: unknown) {
@@ -309,6 +310,12 @@ wss.on('connection', (ws) => {
   let audioStreaming = false;
   let audioChunks: Buffer[] = [];
 
+  // Barge-in: when the child talks over Buddly, the toy sends a `cancel` frame.
+  // We abort the in-flight reply so its LLM request stops, no further TTS audio
+  // is emitted, and tokens aren't wasted finishing a reply nobody will hear.
+  // Set by handleTurn for the duration of a turn; aborted by the `cancel` handler.
+  let activeTurnAbort: AbortController | null = null;
+
   interface TurnParams {
     text: string;
     reasoning?: ReasoningMode;
@@ -320,6 +327,12 @@ wss.on('connection', (ws) => {
   }
 
   const handleTurn = async (p: TurnParams) => {
+    // Barge-in: an AbortController scoped to this turn. A `cancel` frame from the
+    // toy (child talked over Buddly) aborts it — stopping the LLM fetch and
+    // suppressing any further audio. Replaces any prior turn's controller.
+    const abort = new AbortController();
+    activeTurnAbort = abort;
+
     // Resolve device config from Supabase if a hardware device_id was sent
     if (p.device_id && !deviceRowId) {
       const dev = await getDeviceConfig(p.device_id!);
@@ -381,12 +394,12 @@ wss.on('connection', (ws) => {
       const myAudioMs = emittedAudioMs;                   // this chunk's start offset
       emittedAudioMs += durMs;
       paceChain = paceChain.then(async () => {
-        if (ws.readyState !== ws.OPEN) return;
+        if (ws.readyState !== ws.OPEN || abort.signal.aborted) return;
         if (!firstEmitAt) firstEmitAt = Date.now();
         const aheadMs = myAudioMs - (Date.now() - firstEmitAt);
         if (aheadMs > AUDIO_LEAD_MS) {
           await new Promise((r) => setTimeout(r, aheadMs - AUDIO_LEAD_MS));
-          if (ws.readyState !== ws.OPEN) return;
+          if (ws.readyState !== ws.OPEN || abort.signal.aborted) return;
         }
         emitAudio(pcm, sampleRate, encoding);
       });
@@ -470,7 +483,7 @@ wss.on('connection', (ws) => {
         else if (isFinal) tts!.send('', true);
       };
 
-      for await (const ev of session.send(p.text, { reasoning, model, temperature })) {
+      for await (const ev of session.send(p.text, { reasoning, model, temperature, signal: abort.signal })) {
         if (ev.type === 'delta') {
           if (!firstTokenLogged) {
             firstTokenLogged = true;
@@ -541,8 +554,9 @@ wss.on('connection', (ws) => {
         }
       }
 
-      // Persist assistant reply
-      if (assistantText.trim()) {
+      // Persist assistant reply. Skip on barge-in: the child cut Buddly off, so
+      // the partial reply was never fully heard and shouldn't enter history.
+      if (!abort.signal.aborted && assistantText.trim()) {
         void appendMessage(currentConversationId!, 'assistant', assistantText.trim());
         if (currentConversationId) { convMessageCount++; lastActivityAt = Date.now(); }
       }
@@ -550,8 +564,9 @@ wss.on('connection', (ws) => {
       // Surface silent TTS failures: if speech was expected but no audio frame
       // ever went out, the provider failed/was swallowed. Tell the device so it
       // shows an error (red) instead of sitting mute — this is what made "toy
-      // won't talk" undiagnosable before.
-      if (ttsEnabled && !firstAudioLogged && assistantText.trim()) {
+      // won't talk" undiagnosable before. (A barge-in cancel legitimately emits
+      // no/partial audio, so it must not be reported as a failure.)
+      if (ttsEnabled && !firstAudioLogged && assistantText.trim() && !abort.signal.aborted) {
         console.error(`[tts] no audio emitted for provider=${ttsProvider} — text was "${assistantText.slice(0, 60)}"`);
         convHadTtsError = true;
         safeSend(ws, { type: 'error', message: `tts produced no audio (${ttsProvider})` });
@@ -563,13 +578,23 @@ wss.on('connection', (ws) => {
       // the throttled final chunks or the end of the reply gets cut.
       await paceChain;
 
-      sendLatency(ws, 'total', Date.now() - t0);
-      safeSend(ws, { type: 'done' });
+      if (!abort.signal.aborted) {
+        sendLatency(ws, 'total', Date.now() - t0);
+        safeSend(ws, { type: 'done' });
+      }
     } catch (err) {
-      console.error('[err]', err);
-      safeSend(ws, { type: 'error', message: (err as Error).message });
+      // A barge-in abort surfaces here as an AbortError from the LLM fetch — that
+      // is expected, not a failure, so don't blink the toy red. The toy is
+      // already starting the child's new utterance.
+      if (abort.signal.aborted) {
+        console.log('[cancel] turn aborted by barge-in');
+      } else {
+        console.error('[err]', err);
+        safeSend(ws, { type: 'error', message: (err as Error).message });
+      }
     } finally {
       (tts as TtsSession | null)?.close();
+      if (activeTurnAbort === abort) activeTurnAbort = null;
     }
   };
 
@@ -628,6 +653,16 @@ wss.on('connection', (ws) => {
     if (msg?.type === 'audio_cancel') {
       audioStreaming = false;
       audioChunks = [];
+      return;
+    }
+    // Barge-in: the child started talking over Buddly. Abort the in-flight reply
+    // so the LLM stops and no more TTS audio is sent; the toy has already drained
+    // its own playback buffer and is about to stream the new utterance.
+    if (msg?.type === 'cancel') {
+      if (activeTurnAbort) {
+        console.log('[cancel] barge-in — aborting current turn');
+        activeTurnAbort.abort();
+      }
       return;
     }
     if (msg?.type === 'audio_end') {

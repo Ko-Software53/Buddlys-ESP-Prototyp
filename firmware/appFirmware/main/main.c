@@ -24,6 +24,7 @@
 #include "settings.h"
 #include "nvs_config.h"
 #include "ble_prov.h"
+#include "afe_frontend.h"
 
 static const char *TAG = "buddly";
 
@@ -275,7 +276,10 @@ static void open_record(void)
     esp_codec_dev_handle_t rec = get_record_handle();
     esp_codec_dev_sample_info_t info = {
         .sample_rate    = MIC_SAMPLE_RATE,
-        .channel        = MIC_CHANNELS,
+        // Open all 4 TDM slots (two mics + the speaker echo-reference) so the AFE
+        // can run AEC. The raw 4-channel interleaved stream is consumed only by the
+        // AFE feed task; the rest of the firmware sees the AFE's cleaned MONO output.
+        .channel        = MIC_TDM_CHANNELS,
         .bits_per_sample = MIC_BITS,
     };
     esp_codec_dev_open(rec, &info);
@@ -952,15 +956,13 @@ static void start_recording(void)
 static void capture_chunk(void)
 {
     if (!s_recording) return;
-    esp_codec_dev_handle_t rec = get_record_handle();
 
     const size_t frames = MIC_SAMPLE_RATE * 20 / 1000;
-    int16_t stereo[frames * MIC_CHANNELS];
-    if (esp_codec_dev_read(rec, stereo, sizeof(stereo)) != 0) return;
+    int16_t clean[frames];   // echo-cancelled mono from the AFE
+    if (!afe_frontend_read_frame(clean, frames)) return;
 
     for (size_t i = 0; i < frames && s_rec_samples < s_rec_cap; i++) {
-        int32_t mixed = ((int32_t)stereo[i * 2] + stereo[i * 2 + 1]) / 2;
-        s_rec_buf[s_rec_samples++] = mic_gain((int16_t)mixed);
+        s_rec_buf[s_rec_samples++] = mic_gain(clean[i]);
     }
     if (s_rec_samples >= s_rec_cap) {
         ESP_LOGW(TAG, "Recording buffer full");
@@ -1031,17 +1033,18 @@ static int16_t chunk_rms(const int16_t *buf, size_t n)
 
 static void vad_capture_chunk(void)
 {
-    esp_codec_dev_handle_t rec = get_record_handle();
     const size_t frames = MIC_SAMPLE_RATE * 20 / 1000;
-    int16_t stereo[frames * MIC_CHANNELS];
-    if (esp_codec_dev_read(rec, stereo, sizeof(stereo)) != 0) return;
+    // Echo-cancelled MONO frame from the AFE. Because Buddly's own voice is removed,
+    // fvad below fires only on the child — so this same path works DURING playback
+    // and the in-speech branch can interrupt (barge-in).
+    int16_t clean[frames];
+    if (!afe_frontend_read_frame(clean, frames)) return;
 
     int16_t mono[frames];     // full mic gain → recording buffer (STT needs it loud)
     int16_t vad_in[frames];   // pre-software-gain → fvad (see below)
     for (size_t i = 0; i < frames; i++) {
-        int32_t mixed = ((int32_t)stereo[i * 2] + stereo[i * 2 + 1]) / 2;
-        vad_in[i] = (int16_t)mixed;            // post-HW-gain only: cannot clip (avg of two int16)
-        mono[i]   = mic_gain((int16_t)mixed);  // + MIC_SW_GAIN, clamped, for the recording
+        vad_in[i] = clean[i];            // AEC output, un-amplified, for fvad
+        mono[i]   = mic_gain(clean[i]);  // + MIC_SW_GAIN, clamped, for the recording
     }
 
     // Voice activity decision for this 20 ms frame: 1 = speech, 0 = non-speech,
@@ -1087,9 +1090,15 @@ static void vad_capture_chunk(void)
         // uploading (audio_start..audio_end), so the two streams can't interleave.
         if (s_onset_frames >= VAD_ONSET_SPEECH_FRAMES && !s_streaming) {
             if (playing_back) {
+                // Barge-in: the child talked over Buddly. Dump the queued TTS audio,
+                // mark the reply finished locally (the server won't send `done` for
+                // an aborted turn), and tell the server to stop generating it so no
+                // stale audio arrives and tokens aren't wasted.
                 s_drain_jbuf       = true;
+                s_stream_active    = false;
                 s_last_speaking_ms = 0;
-                ESP_LOGI(TAG, "VAD: interrupt (speech)");
+                send_audio_ctrl("cancel");
+                ESP_LOGI(TAG, "VAD: interrupt (speech) → cancel");
             } else {
                 ESP_LOGI(TAG, "VAD: speech onset");
             }
@@ -1288,6 +1297,15 @@ void app_main(void)
     ws_connect(ws_uri);
 
     vad_init();
+
+    // Bring up the AEC audio front-end. From here the mic is delivered as an
+    // echo-cancelled MONO stream (see afe_frontend_read_frame), which is what lets
+    // the child interrupt Buddly mid-reply (barge-in) without the toy hearing its
+    // own voice. If this fails we keep running — capture just won't get frames.
+    if (!afe_frontend_init()) {
+        ESP_LOGE(TAG, "AFE init failed — mic/barge-in unavailable");
+    }
+
     ESP_LOGI(TAG, "Ready — mode=%s (long-press power to toggle)",
              s_talk_mode ? "VAD" : "push-to-talk");
 
@@ -1360,14 +1378,23 @@ void app_main(void)
             s_last_batt_ms = now_ms();
         }
 
-        // Half-duplex: while Buddly is speaking (plus a short echo-tail), do not
-        // touch the microphone. The mic and speaker share one I2S codec, so
-        // reading the mic during playback both starves the speaker (stuttering)
-        // and feeds the speaker's own output back in as "speech" (echo loop, no
-        // AEC on this board). Buttons stay responsive; capture resumes once
-        // playback ends.
         bool playing_back = s_stream_active ||
                             (now_ms() - s_last_speaking_ms) < VAD_SUPPRESS_MS;
+
+        // VAD mode + AEC barge-in: keep the mic LIVE during playback so the child
+        // can interrupt. The AFE strips Buddly's own voice from the mic, so
+        // vad_capture_chunk fires only on the child; its in-speech onset branch
+        // drains the queued audio and sends `cancel` to the server. read_frame
+        // paces this loop at realtime (~one 20 ms frame per call).
+        if (BUDDLY_BARGE_IN && s_talk_mode == 1) {
+            vad_capture_chunk();
+            continue;
+        }
+
+        // Half-duplex (push-to-talk, or barge-in disabled): while Buddly is speaking
+        // (plus a short echo-tail), ignore the microphone. The mic and speaker share
+        // one I2S codec; here we choose not to capture during playback. Buttons stay
+        // responsive; capture resumes once playback ends.
         if (playing_back) {
             if (s_recording)   { s_recording = false; s_rec_samples = 0; }
             if (s_streaming)   s_stream_cancel = true;  // abort any in-progress upload
