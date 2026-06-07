@@ -484,6 +484,11 @@ wss.on('connection', (ws) => {
       };
 
       for await (const ev of session.send(p.text, { reasoning, model, temperature, signal: abort.signal })) {
+        // Barge-in: stop consuming immediately. The fetch signal also aborts the
+        // HTTP request, but one already-buffered SSE chunk can still carry several
+        // tokens; breaking here drops them within a single event instead of
+        // emitting the rest of the buffered burst.
+        if (abort.signal.aborted) break;
         if (ev.type === 'delta') {
           if (!firstTokenLogged) {
             firstTokenLogged = true;
