@@ -193,15 +193,16 @@ function fixTtsNumbers(text: string): string {
 wss.on('connection', (ws) => {
   console.log('[ws] client connected');
 
-  // Keep the connection alive with pings every 5 seconds.
-  // This prevents the ESP32's 20-second network_timeout_ms from dropping the connection
-  // if the STT or LLM takes longer than 20 seconds to respond.
+  // One standards-compliant heartbeat is enough. The previous 2-second WS ping
+  // plus JSON ping continuously interleaved control traffic with PCM frames and
+  // made disconnects much harder to diagnose. The ESP also sends its own ping.
   const pingInterval = setInterval(() => {
     if (ws.readyState === ws.OPEN) {
-      ws.ping();
-      safeSend(ws, { type: 'ping' });
+      ws.ping(undefined, undefined, (err) => {
+        if (err) console.warn(`[ws] heartbeat failed: ${err.message}`);
+      });
     }
-  }, 2000);
+  }, 15000);
 
   const session = new ConversationSession();
   const sessionStart = Date.now();
@@ -227,23 +228,57 @@ wss.on('connection', (ws) => {
   // any pre-flash firmware omit the flag and keep the JSON audio_chunk path.
   let wantsBinaryAudio = false;
 
+  // Serialize audio writes and observe socket backpressure. ws.send() otherwise
+  // queues every PCM chunk immediately; during a long reply that can leave a
+  // large native socket queue and Railway/clients may reset the connection while
+  // audio is still buffered. Awaiting each send also makes `done` mean the tail
+  // was handed to the socket, rather than merely appended to an unbounded queue.
+  const WS_HIGH_WATER_BYTES = 64 * 1024;
+
+  const waitForSocketCapacity = async (nextBytes: number): Promise<boolean> => {
+    while (ws.readyState === ws.OPEN &&
+           ws.bufferedAmount + nextBytes > WS_HIGH_WATER_BYTES) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    return ws.readyState === ws.OPEN;
+  };
+
+  const sendFrame = async (data: Buffer | string): Promise<boolean> => {
+    const bytes = typeof data === 'string' ? Buffer.byteLength(data) : data.length;
+    if (!await waitForSocketCapacity(bytes)) return false;
+
+    return await new Promise<boolean>((resolve) => {
+      if (ws.readyState !== ws.OPEN) { resolve(false); return; }
+      try {
+        ws.send(data, (err) => {
+          if (err) console.warn(`[ws] send failed: ${err.message}`);
+          resolve(!err);
+        });
+      } catch (err) {
+        console.warn(`[ws] send threw: ${(err as Error).message}`);
+        resolve(false);
+      }
+    });
+  };
+
   // Emit one PCM audio chunk to this client in its negotiated framing. For binary
   // clients the metadata (sampleRate/encoding) is implicit (always 16 kHz s16le,
   // which the device assumes anyway); JSON clients still get it in the frame.
-  const emitAudio = (pcm: Buffer, sampleRate: number, encoding: 'pcm_s16le') => {
+  const emitAudio = async (pcm: Buffer, sampleRate: number, encoding: 'pcm_s16le') => {
     if (ws.readyState !== ws.OPEN) return;
     const MAX_CHUNK = 4096;
     for (let offset = 0; offset < pcm.length; offset += MAX_CHUNK) {
       const chunk = pcm.subarray(offset, offset + MAX_CHUNK);
       if (wantsBinaryAudio) {
-        ws.send(chunk);
+        if (!await sendFrame(chunk)) return;
       } else {
-        ws.send(JSON.stringify({
+        const frame = JSON.stringify({
           type: 'audio_chunk',
           encoding,
           sampleRate,
           audioBase64: chunk.toString('base64')
-        }));
+        });
+        if (!await sendFrame(frame)) return;
       }
     }
   };
@@ -401,7 +436,7 @@ wss.on('connection', (ws) => {
           await new Promise((r) => setTimeout(r, aheadMs - AUDIO_LEAD_MS));
           if (ws.readyState !== ws.OPEN || abort.signal.aborted) return;
         }
-        emitAudio(pcm, sampleRate, encoding);
+        await emitAudio(pcm, sampleRate, encoding);
       });
     };
 
@@ -711,10 +746,16 @@ wss.on('connection', (ws) => {
     });
   });
 
-  ws.on('close', () => {
+  ws.on('error', (err) => {
+    console.error(`[ws] client socket error: ${err.message} buffered=${ws.bufferedAmount}`);
+  });
+
+  ws.on('close', (code, reason) => {
     clearInterval(pingInterval);
     finalizeCurrent();
-    console.log('[ws] client disconnected');
+    console.log(
+      `[ws] client disconnected code=${code} reason=${reason.toString() || '-'} buffered=${ws.bufferedAmount}`,
+    );
   });
 });
 
