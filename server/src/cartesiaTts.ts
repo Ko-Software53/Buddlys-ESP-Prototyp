@@ -98,13 +98,14 @@ export async function openCartesiaSession(
     }
   };
 
-  ws.on('open', () => {
-    keepAliveInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        try { ws.ping(); } catch {}
-      }
-    }, 4000);
-  });
+  // The socket is already open here (awaited above), so start the keepalive
+  // directly — an `ws.on('open')` registered at this point would never fire,
+  // which silently disabled the ping for every session.
+  keepAliveInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.ping(); } catch {}
+    }
+  }, 4000);
 
   ws.on('message', (raw) => {
     let msg: { type?: string; data?: string; error?: string; context_id?: string };

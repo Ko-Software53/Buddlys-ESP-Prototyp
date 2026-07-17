@@ -351,6 +351,13 @@ wss.on('connection', (ws) => {
   // Set by handleTurn for the duration of a turn; aborted by the `cancel` handler.
   let activeTurnAbort: AbortController | null = null;
 
+  // The currently running turn, if any. Turns on one connection must never run
+  // concurrently: ws.on('message') handlers are unawaited, so before this
+  // guard a stray second utterance (e.g. an echo ghost-upload from the toy)
+  // started a SECOND handleTurn — two answers interleaved into one toy and
+  // into one shared conversation history.
+  let activeTurn: Promise<void> | null = null;
+
   interface TurnParams {
     text: string;
     reasoning?: ReasoningMode;
@@ -419,7 +426,9 @@ wss.on('connection', (ws) => {
     // later chunks are delayed. Chunks are serialized on a promise chain so they
     // keep order and the accumulated delay is correct regardless of how fast the
     // TTS onChunk callback fires.
-    const AUDIO_LEAD_MS = 6500;
+    // 5500 not 6500: lead + the toy's 1500 ms prebuffer must stay clearly under
+    // its 8 s jitter ring, or a fast network pegs the ring exactly full.
+    const AUDIO_LEAD_MS = 5500;
     let emittedAudioMs = 0;          // total audio duration enqueued this turn (ms)
     let firstEmitAt = 0;             // wall-clock of the first emitted chunk
     let paceChain: Promise<void> = Promise.resolve();
@@ -638,6 +647,26 @@ wss.on('connection', (ws) => {
     }
   };
 
+  // Serialize turns on this connection. While a turn is streaming and has NOT
+  // been cancelled, a new utterance is dropped (answered with `done` so the
+  // client's turn state resolves). After a barge-in cancel the previous turn
+  // is winding down — wait for it, then run the new turn.
+  const runTurn = async (p: TurnParams) => {
+    if (activeTurn) {
+      if (activeTurnAbort && !activeTurnAbort.signal.aborted) {
+        // No `done` here: the active turn is still streaming and will send its
+        // own — an extra one would clear the toy's stream state mid-playback.
+        console.log('[turn] dropped — another turn is already streaming');
+        return;
+      }
+      await activeTurn.catch(() => {});
+    }
+    activeTurn = handleTurn(p).finally(() => {
+      activeTurn = null;
+    });
+    await activeTurn;
+  };
+
   // STT for device audio sent over the WebSocket as a binary WAV frame. Reuses
   // the persistent connection, so the device pays no per-turn TLS handshake
   // (the old HTTPS /stt POST opened a fresh TLS connection on every turn).
@@ -657,7 +686,7 @@ wss.on('connection', (ws) => {
       safeSend(ws, { type: 'done' });
       return;
     }
-    await handleTurn({ text, ...turnCfg });
+    await runTurn({ text, ...turnCfg });
   };
 
   ws.on('message', async (raw, isBinary) => {
@@ -735,7 +764,7 @@ wss.on('connection', (ws) => {
     if (msg?.type !== 'user_text' || typeof msg.text !== 'string' || !msg.text.trim()) {
       return;
     }
-    await handleTurn({
+    await runTurn({
       text: msg.text,
       reasoning: msg.reasoning,
       model: msg.model,
@@ -752,6 +781,13 @@ wss.on('connection', (ws) => {
 
   ws.on('close', (code, reason) => {
     clearInterval(pingInterval);
+    // Stop the in-flight turn: without this the LLM stream and TTS rendering
+    // ran on into a dead socket — wasted tokens, and the zombie turn's log
+    // lines interleaved with the toy's reconnected session.
+    if (activeTurnAbort && !activeTurnAbort.signal.aborted) {
+      console.log('[ws] closing — aborting in-flight turn');
+      activeTurnAbort.abort();
+    }
     finalizeCurrent();
     console.log(
       `[ws] client disconnected code=${code} reason=${reason.toString() || '-'} buffered=${ws.bufferedAmount}`,
